@@ -1,4 +1,4 @@
-# Перелік файлів пакета · TenderWin Lead & Mail 1.4.0
+# Перелік файлів пакета · TenderWin Lead & Mail 1.4.0 · ноутбук 1.4.1
 
 Зібрано 06.10.2026. Контрольні суми — SHA-256, перші 16 символів.
 
@@ -8,7 +8,7 @@
 | `tenderwin_service_cards.py` | 114564 | `a12a123e6e6999c8` | 1.0.0 + правки 1.1.0 (теки «0 Cases») |
 | `tenderwin_lead_engine.py` | 558590 | `5841af2f3a8ae529` | без змін |
 | `lead_machine_v1.py` | 57511 | `165d343ac9ccad0b` | без змін |
-| `TenderWin_Lead_Mail_v1.4.ipynb` | 31605 | `02cb46634e42117c` | ноутбук 1.3 + V9, «0 Cases», робоча тека «1 Lead&Mail generator», перевірка версій |
+| `TenderWin_Lead_Mail_v1.4.1.ipynb` | 42474 | `3ff37a382ea74fbe` | ноутбук 1.4.1: робоча тека «1 Lead&Mail generator», одноразове перенесення бази, перевірка версій, клітинка 9 |
 | `testy/test_lead_mail.py` | 81368 | `18fe8850e360419c` | + тести V9, зафіксований годинник |
 | `testy/test_0_cases.py` | 12774 | `6e3c24ed539f745a` | новий: теки справ «0 Cases» |
 | `testy/test_lead_engine.py` | 101233 | `6dff6e34265d880f` | без змін |
