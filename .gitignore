@@ -10,6 +10,7 @@ client_secret*.json
 vyhid_lystiv/
 Службові картки/
 Протоколи відхилень/
+0 Cases/
 
 # Python
 __pycache__/

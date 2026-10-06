@@ -187,10 +187,15 @@ class Base(unittest.TestCase):
         M.TEST_RECIPIENTS = ["test1@example.com", "test2@example.com"]
         M.DB_PATH, M.OUT_DIR = self.db_path, os.path.join(self.tmp, "vyhid")
         M.LEGACY_DB_PATH = os.path.join(self.tmp, "немає.db")
+        # Годинник зафіксовано: інакше строки оскарження з фікстур (27.09)
+        # «минають» у реальному часі, і тести падають щодня після них.
+        self._real_now = M.now
+        M.now = lambda: TODAY
 
     def tearDown(self):
         for key, value in self.saved.items():
             setattr(M, key, value)
+        M.now = self._real_now
 
     def engine(self):
         eng = M.LeadMail(db_path=self.db_path,
@@ -662,7 +667,11 @@ class TestLetters(Base):
 
 
 class TestLetterV8(Base):
-    """Чинний лист: затверджений текст + оформлення, яке побачить клієнт."""
+    """Лист V8 (23.09.2026): заморожена версія — текст не змінюється."""
+
+    def setUp(self):
+        super().setUp()
+        M.LETTER_VERSION = "V8_OWNER"
 
     def лист(self, cp_end=None, title="Капітальний ремонт покрівлі"):
         t = tender(bids=[bid("b1")],
@@ -675,8 +684,7 @@ class TestLetterV8(Base):
         eng.close()
         return row
 
-    def test_v8_is_the_active_letter(self):
-        self.assertEqual(M.LETTER_VERSION, "V8_OWNER")
+    def test_v8_still_renders_when_chosen(self):
         self.assertEqual(self.лист()["template_version"], "V8_OWNER")
 
     def test_previous_versions_stay_frozen(self):
@@ -687,6 +695,8 @@ class TestLetterV8(Base):
                       M.ALL_TEMPLATES["V7_OWNER"].body)
         self.assertNotIn("Я уважно зіставлю", M.ALL_TEMPLATES["V7_OWNER"].body)
         self.assertIn("Я уважно зіставлю", M.ALL_TEMPLATES["V8_OWNER"].body)
+        self.assertIn("Якщо питання актуальне — просто відповідайте на цей лист",
+                      M.ALL_TEMPLATES["V8_OWNER"].body)
 
     def test_text_matches_the_approved_wording(self):
         """Золотий текст V8 — слово в слово, як затвердив власник."""
@@ -874,6 +884,153 @@ class TestLetterV8(Base):
         self.assertEqual(out["з_оформленням"], 1)
         self.assertTrue(any(f.endswith(".html") for f in файли))
         self.assertTrue(any(f.endswith(".eml") for f in файли))
+
+
+class TestLetterV9(Base):
+    """Чинний лист V9 (06.10.2026): V8 з правками власника."""
+
+    def лист(self, cp_end=None, title="Капітальний ремонт покрівлі"):
+        t = tender(bids=[bid("b1")],
+                   awards=[award("a1", "b1", date=iso(22, 11), cp_start=iso(22, 11),
+                                 cp_end=cp_end or iso(27, 0))])
+        t["title"] = title
+        eng, _ = self.run_scan([t])
+        eng.build_letters()
+        row = eng.db.one("SELECT * FROM outreach")
+        eng.close()
+        return row
+
+    def test_v9_is_the_active_letter(self):
+        self.assertEqual(M.LETTER_VERSION, "V9_OWNER")
+        self.assertEqual(self.лист()["template_version"], "V9_OWNER")
+
+    def test_text_matches_the_approved_wording(self):
+        """Золотий текст V9 — слово в слово, як затвердив власник 06.10.2026."""
+        row = self.лист()
+        очікувано = (
+            "Добрий день, Іване!\n"
+            "\n"
+            "Побачив у Prozorro, що пропозицію ТОВ «БУДІНВЕСТ» "
+            "(ЄДРПОУ 12345678) в закупівлі UA-2026-09-01-000001-a "
+            "«Капітальний ремонт покрівлі» відхилено "
+            "(22 вересня 2026 року об 11:00).\n"
+            "\n"
+            "Питання після такого рішення зазвичай одне: чи справді підстави "
+            "були і чи варто витрачати гроші на оскарження.\n"
+            "\n"
+            "Дам на нього дуже детальну письмову відповідь:\n"
+            "\n"
+            "• чи були підстави для відхилення,\n"
+            "• які ризики,\n"
+            "• що доцільно робити далі.\n"
+            "\n"
+            "Я зіставлю те, що написав Замовник у рішенні, з вимогами "
+            "тендерної документації, документами Вашої тендерної пропозиції "
+            "та практикою АМКУ. Якщо підстав для скарги немає, напишу про це "
+            "прямо.\n"
+            "\n"
+            "Якщо підстави для скарги є, то складеного мною аналізу зазвичай "
+            "Вам буде достатньо, щоб самостійно подати скаргу в АМКУ, не "
+            "витрачаючи зайвих коштів на юридичний супровід.\n"
+            "\n"
+            "Вартість — 3 499 грн за одне рішення про відхилення, з усіма "
+            "підставами, які в ньому названі.\n"
+            "Висновок — протягом 24 годин після оплати.\n"
+            "\n"
+            "У Prozorro подати скаргу на це рішення можна до "
+            "27 вересня 2026 року о 00:00.\n"
+            "\n"
+            "Побачити, як виглядає мій аналіз, Ви можете тут: "
+            "https://tenderwin.in.ua\n"
+            "\n"
+            "З повагою,\n"
+            "Віталій Щасливий\n"
+            "радник з публічних закупівель\n"
+            "+380 800 357 135\n")
+        self.assertEqual(row["body_rendered"], очікувано)
+        self.assertEqual(row["subject_rendered"],
+                         "Відхилення у закупівлі UA-2026-09-01-000001-a: "
+                         "чи є підстави для оскарження?")
+
+    def test_html_has_the_same_words_as_the_text(self):
+        import re as _re
+        html = self.лист()["body_html"]
+        текст_з_html = _re.sub(r"<[^>]+>", " ", html)
+        текст_з_html = _re.sub(r"\s+", " ", текст_з_html).replace("&amp;", "&")
+        for речення in ("що доцільно робити далі.",
+                        "Я зіставлю те, що написав Замовник у рішенні, з вимогами "
+                        "тендерної документації, документами Вашої тендерної "
+                        "пропозиції та практикою АМКУ.",
+                        "Якщо підстави для скарги є, то складеного мною аналізу "
+                        "зазвичай Вам буде достатньо, щоб самостійно подати "
+                        "скаргу в АМКУ, не витрачаючи зайвих коштів",
+                        "Вартість — 3 499 грн",
+                        "Побачити, як виглядає мій аналіз, Ви можете тут: "
+                        "tenderwin.in.ua",
+                        "З повагою, Віталій Щасливий радник з публічних "
+                        "закупівель +380 800 357 135"):
+            self.assertIn(речення, текст_з_html, речення)
+
+    def test_old_wording_is_gone(self):
+        row = self.лист()
+        for було in ("Якщо питання актуальне", "відповідайте на цей лист",
+                     "Я уважно зіставлю", "Зазвичай цього достатньо",
+                     "(якщо це доцільно)", "вашими документами",
+                     "50 310 14 92", "TenderWin"):
+            self.assertNotIn(було, row["body_rendered"], було)
+            self.assertNotIn(було, row["body_html"], було)
+
+    def test_only_link_is_the_example_of_analysis(self):
+        """Підпис без посилань: у листі одне посилання — на приклад аналізу."""
+        html = self.лист()["body_html"]
+        self.assertEqual(html.count("<a "), 1)
+        self.assertIn('Ви можете тут: <a href="https://tenderwin.in.ua"', html)
+        self.assertNotIn("tel:", html)
+        підпис = html[html.index("З повагою"):]
+        self.assertNotIn("<a", підпис)
+        self.assertIn("радник з публічних закупівель<br>+380 800 357 135</p>",
+                      підпис)
+
+    def test_example_link_follows_the_setting(self):
+        M.ANALYSIS_EXAMPLE_URL = "https://tenderwin.in.ua/pryklad"
+        M.ANALYSIS_EXAMPLE_LABEL = "tenderwin.in.ua/pryklad"
+        try:
+            row = self.лист()
+        finally:
+            M.ANALYSIS_EXAMPLE_URL = M.SITE_URL
+            M.ANALYSIS_EXAMPLE_LABEL = M.SITE_LABEL
+        self.assertIn("тут: https://tenderwin.in.ua/pryklad\n", row["body_rendered"])
+        self.assertIn('href="https://tenderwin.in.ua/pryklad"', row["body_html"])
+
+    def test_two_rejections_work_in_v9(self):
+        t1 = tender(uid="t1", ua="UA-2026-09-01-000001-a",
+                    bids=[bid("b1")],
+                    awards=[award("a1", "b1", date=iso(22, 11), cp_start=iso(22, 11),
+                                  cp_end=iso(27, 0))])
+        t2 = tender(uid="t2", ua="UA-2026-09-02-000002-a", value=9_000_000,
+                    bids=[bid("b1")],
+                    awards=[award("a2", "b1", date=iso(22, 15, 45),
+                                  cp_start=iso(22, 15, 45), cp_end=iso(28, 0))])
+        eng, _ = self.run_scan([t1, t2])
+        eng.build_letters()
+        row = eng.db.one("SELECT * FROM outreach")
+        eng.close()
+        self.assertEqual(row["template_version"], "V9_OWNER")
+        self.assertIn("• UA-2026-09-02-000002-a", row["body_rendered"])
+        self.assertIn("найраніший строк", row["body_rendered"])
+        self.assertIn("+380 800 357 135", row["body_rendered"])
+
+    def test_text_only_mode_produces_no_html(self):
+        M.LETTER_FORMAT = "TEXT_ONLY"
+        row = self.лист()
+        self.assertIsNone(row["body_html"])
+        self.assertIn("https://tenderwin.in.ua", row["body_rendered"])
+
+    def test_html_has_no_images_scripts_or_tracking(self):
+        html = self.лист()["body_html"]
+        for заборонено in ("<img", "<script", "<iframe", "background-image",
+                           "url(", "onclick", "<form"):
+            self.assertNotIn(заборонено, html.lower(), заборонено)
 
 
 class TestGmailAccess(Base):

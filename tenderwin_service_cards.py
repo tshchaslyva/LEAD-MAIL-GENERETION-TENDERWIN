@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
- TENDERWIN SERVICE CARDS v1.0.0 · СЛУЖБОВІ КАРТКИ ВІДХИЛЕНЬ І ПРОТОКОЛИ
+ TENDERWIN SERVICE CARDS v1.1.0 · СЛУЖБОВІ КАРТКИ ВІДХИЛЕНЬ І ПРОТОКОЛИ
 =============================================================================
 
  ЩО ЦЕ
@@ -17,9 +17,20 @@
       про невідповідності) — і більше нічого;
    3. витягує з них текст посторінково, без OCR; сторінки без текстового
       шару називає поіменно;
-   4. кладе в теку події файли, manifest.json і «Службову картку
+   4. кладе в теку справи файли, manifest.json і «Службову картку
       відхилення» (.docx — відкривається просто на Google Диску);
    5. складає перелік усіх подій (.xlsx) — з нього відбирають справи.
+
+ ДЕ ЛЕЖАТЬ СПРАВИ (з 1.1.0, рішення власника 06.10.2026)
+
+   <тека справ>/<ID закупівлі> <ЄДРПОУ або ІПН учасника>/
+       Службова_картка_<ID закупівлі>.docx
+       01_Протокол….pdf          ← документи самого рішення замовника
+       manifest.json
+
+   Тека справ — «Мій диск/0 Cases» (на компʼютері G:\\Мій диск\\0 Cases);
+   її передає Lead & Mail. Перелік для відбору і журнал помилок лежать
+   окремо (index_root), щоб у теці справ були лише справи.
 
  ГАРАНТІЇ
 
@@ -65,8 +76,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0.0"
-BUILD = "2026-10-04"
+VERSION = "1.1.0"
+BUILD = "2026-10-06"
 MANIFEST_SCHEMA = "tenderwin.service_card/1"
 KYIV = ZoneInfo("Europe/Kyiv")
 
@@ -113,6 +124,12 @@ BLIND_COMPLAINT_OUTCOMES = True
 MAX_NAME_BYTES = 150
 
 MANIFEST_NAME = "manifest.json"
+#: Назва теки справи: ID закупівлі + ЄДРПОУ (ІПН) відхиленого учасника
+#: (рішення власника 06.10.2026), наприклад «UA-2026-10-02-004417-a 41234567».
+CASE_FOLDER_PATTERN = "{ua_id} {code}"
+#: Скільки справ того самого учасника в тій самій закупівлі розрізняти
+#: номером « (2)», « (3)»… Далі — хвіст ID рішення.
+MAX_SAME_CASE = 50
 CARD_PREFIX = "Службова_картка_"
 INDEX_PREFIX = "_ПЕРЕЛІК_"
 NOT_ESTABLISHED = "НЕ ВСТАНОВЛЕНО"
@@ -355,16 +372,79 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+#: Символи, яких не приймають Windows і Google Диск для компʼютера.
+_FOLDER_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
 def case_folder_name(row: dict) -> str:
     """
-    Тека події: ID закупівлі + код учасника + початок ID рішення.
+    Тека справи: ID закупівлі + ЄДРПОУ (ІПН) відхиленого учасника.
 
-    Саме ідентифікатори, а не назви (правило 15): в одній закупівлі ту саму
-    компанію можна відхилити двічі — у двох лотах, двома рішеннями.
+    Саме ідентифікатори, а не назви (правило 15). Якщо ту саму компанію в
+    тій самій закупівлі відхилили двічі (два лоти, повторне рішення), друга
+    справа отримує номер — це вирішує assign_case_folders().
     """
-    name = (f"{row.get('ua_id') or 'bez-UA'}__{row.get('edrpou_norm') or 'bez-kodu'}"
-            f"__{str(row.get('object_id') or 'bez-id')[:8]}")
-    return re.sub(r"[^\w.\-]", "_", name)
+    name = CASE_FOLDER_PATTERN.format(ua_id=row.get("ua_id") or "bez-UA",
+                                      code=row.get("edrpou_norm") or "bez-kodu")
+    name = re.sub(r"\s+", " ", _FOLDER_BAD.sub("_", name)).strip(" .")
+    return name or "bez-UA bez-kodu"
+
+
+def folder_owner(folder: str) -> Optional[str]:
+    """ID рішення, чия це тека (з manifest.json). None — опису немає:
+    тека нова, порожня або створена людиною."""
+    try:
+        with open(os.path.join(folder, MANIFEST_NAME), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    event = data.get("event") if isinstance(data, dict) else None
+    if not isinstance(event, dict):
+        return None
+    return str(event.get("object_id") or "")
+
+
+def assign_case_folders(rows: list, root: str) -> list:
+    """
+    Тека для кожної події — у тому самому порядку, що й rows.
+
+    Одна тека — одне рішення: якщо учасника в закупівлі відхилили двічі,
+    друга справа не затирає першу, а лягає в «… (2)». Тека, де вже лежить
+    це саме рішення, береться знову: повторний прогін не плодить копій.
+    Рішення про теки ухвалюється тут, до паралельної роботи, тож два потоки
+    ніколи не пишуть в одну теку.
+    """
+    try:
+        existing = set(os.listdir(root))
+    except OSError:
+        existing = set()
+    owners: dict = {}
+
+    def owner(name: str) -> Optional[str]:
+        if name not in owners:
+            owners[name] = (folder_owner(os.path.join(root, name))
+                            if name in existing else None)
+        return owners[name]
+
+    order = sorted(range(len(rows)), key=lambda i: (
+        str(rows[i].get("event_time") or ""), str(rows[i].get("object_id") or "")))
+    taken: dict = {}
+    result = [""] * len(rows)
+    for index in order:
+        row = rows[index]
+        decision = str(row.get("object_id") or "")
+        base = case_folder_name(row)
+        names = [base] + [f"{base} ({n})" for n in range(2, MAX_SAME_CASE + 1)]
+        chosen = next((n for n in names
+                       if taken.get(n, owner(n)) == decision), None)
+        if chosen is None:
+            chosen = next((n for n in names
+                           if n not in taken and owner(n) is None), None)
+        if chosen is None:
+            chosen = f"{base} ({decision[:8] or 'bez-id'})"
+        taken[chosen] = decision
+        result[index] = chosen
+    return result
 
 
 def event_day(row: dict) -> str:
@@ -1517,7 +1597,7 @@ def render_card_docx(ctx: dict) -> bytes:
         ("Прогін", ctx["run_label"]),
         ("Сформовано", ctx["generated_h"]),
         ("Свіжий стан Prozorro", ctx["fresh_h"]),
-        ("Тека події", ctx["folder"]),
+        ("Тека справи", ctx["folder"]),
         ("Опис документів", MANIFEST_NAME),
         ("Версія", f"TenderWin Service Cards {VERSION} · Lead & Mail "
                    f"{ctx.get('lead_mail_version') or ''}".strip()),
@@ -1650,15 +1730,20 @@ def _event_view(row: dict, now_moment: datetime) -> dict:
 
 def build_event(row: dict, fresh: Optional[tuple], root: str, run_label: str,
                 fetcher: Optional[Callable], now_fn: Callable = now_kyiv,
-                lead_mail_version: str = "") -> dict:
+                lead_mail_version: str = "", folder_name: str = "") -> dict:
     """
     Одна подія. Повертає рядок для переліку. Помилка тут не зупиняє інші
     події — її ловить оркестратор і записує в журнал.
+
+    folder_name — тека справи від assign_case_folders(); без неї —
+    «<ID закупівлі> <код учасника>».
     """
     moment = now_fn()
     ev = _event_view(row, moment)
     day = event_day(row)
-    folder = os.path.join(root, day, case_folder_name(row))
+    folder_name = folder_name or case_folder_name(row)
+    folder = os.path.join(root, folder_name)
+    shown_folder = os.path.join(os.path.basename(os.path.normpath(root)), folder_name)
     os.makedirs(folder, exist_ok=True)
     manifest_prev = load_manifest(folder, now_fn)
     previous = {d.get("identity"): d for d in manifest_prev.get("documents", [])
@@ -1781,7 +1866,7 @@ def build_event(row: dict, fresh: Optional[tuple], root: str, run_label: str,
         "run_label": run_label, "generated_h": fmt_dt(moment),
         "fresh_h": (f"отримано {fmt_dt(parse_dt(fetched_at))}" if decision is not None
                     else f"не отримано: {fresh_error or 'невідомо'}"),
-        "folder": os.path.join(day, os.path.basename(folder)),
+        "folder": shown_folder,
         "lead_mail_version": lead_mail_version,
     }
     payload = render_card_docx(ctx)
@@ -1821,7 +1906,7 @@ def build_event(row: dict, fresh: Optional[tuple], root: str, run_label: str,
         (title,) if same_text else (title, description)) if x), INDEX_TEXT_LIMIT)
     counts = Counter(r.status for r in records)
     return {
-        "ok": True, "day": day, "folder": os.path.join(day, os.path.basename(folder)),
+        "ok": True, "day": day, "folder": shown_folder,
         "card": card_name, "card_action": card_action,
         "ua_id": ev["ua_id"], "prozorro_url": ev["prozorro_url"],
         "event_moment": ev["event_moment"], "buyer": ev["buyer"],
@@ -1853,7 +1938,7 @@ INDEX_COLUMNS = (
     ("Поле рішення в Prozorro (дослівно)", 60),
     ("Текст документів рішення", 18), ("Що з документами", 26),
     ("Фрагмент документа (дослівно)", 70), ("Де фрагмент", 14),
-    ("Тека події", 40), ("Цікаво? (так/ні)", 10), ("Нотатки", 30),
+    ("Тека справи", 40), ("Цікаво? (так/ні)", 10), ("Нотатки", 30),
 )
 
 
@@ -1940,6 +2025,8 @@ def write_index(folder: str, label: str, summaries: list) -> str:
             "«ТЕКСТ Є ЧАСТКОВО» і «СКАН — ТЕКСТУ НЕМАЄ» означають, що частину "
             "сторінок треба прочитати у файлі самостійно. OCR не виконувався.",
             "Строк оскарження — поле Prozorro, а не юридичний висновок.",
+            "«Тека справи» — підтека в теці справ (0 Cases): ID закупівлі і код "
+            "учасника. Там картка, протокол рішення і manifest.json.",
             "Колонки «Цікаво?» і «Нотатки» — для вас. Скрипт цей файл більше "
             "не змінює: кожен прогін створює новий перелік."):
         notes.append([line])
@@ -1970,16 +2057,17 @@ def unused_path(path: str) -> str:
 # ============================================================================
 #  БЛОК 11. ОРКЕСТРАТОР
 # ============================================================================
-def empty_stats(root: str) -> dict:
+def empty_stats(root: str, index_root: str = "") -> dict:
     return {"подій": 0, "карток": {"CREATED": 0, "UPDATED": 0, "KEPT_HUMAN_EDIT": 0,
                                    "FAILED": 0},
             "документів": 0, "стани_документів": {}, "текст_рішення": {},
             "свіжий_стан": {"отримано": 0, "не_отримано": 0},
-            "перелік": [], "тека": root, "помилки": [], "журнал_помилок": "",
-            "тривалість_с": 0.0}
+            "перелік": [], "тека": root, "тека_переліку": index_root or root,
+            "помилки": [], "журнал_помилок": "", "тривалість_с": 0.0}
 
 
 def build_service_cards(rows: list, *, root: str, run_label: str,
+                        index_root: str = "",
                         tender_fetcher: Optional[Callable] = None,
                         doc_fetcher: Optional[Callable] = None,
                         workers: int = 0, verbose: bool = True,
@@ -1989,18 +2077,24 @@ def build_service_cards(rows: list, *, root: str, run_label: str,
     Службові картки для переданих подій.
 
     rows            — рядки подій (dict) від Lead & Mail;
+    root            — тека справ: у ній по підтеці на кожну справу
+                      «<ID закупівлі> <код учасника>» (картка + протокол);
+    index_root      — куди класти перелік .xlsx (у підтеку дня) і журнал
+                      помилок; порожньо — у root;
     tender_fetcher  — uid -> (закупівля або None, код помилки); None — без
                       свіжого стану, лише дані сканування;
     doc_fetcher     — url -> Fetched; None — без завантаження (у картці так і
                       буде написано).
     """
     started = time.time()
-    stats = empty_stats(root)
+    index_root = index_root or root
+    stats = empty_stats(root, index_root)
     rows = [dict(r) for r in rows]
     stats["подій"] = len(rows)
     if not rows:
         return stats
     os.makedirs(root, exist_ok=True)
+    folders = assign_case_folders(rows, root)
 
     fresh: dict = {}
     if tender_fetcher is not None:
@@ -2020,20 +2114,34 @@ def build_service_cards(rows: list, *, root: str, run_label: str,
                 fresh[uid] = (data, error or ("" if data else "EMPTY"), at)
                 stats["свіжий_стан"]["отримано" if data else "не_отримано"] += 1
 
+    # Події однієї теки обробляються по черзі в одному потоці: два потоки
+    # не пишуть файли в ту саму теку одночасно.
+    groups: dict = {}
+    for row, name in zip(rows, folders):
+        groups.setdefault(name, []).append(row)
+
+    def run_group(name: str, items: list) -> list:
+        out = []
+        for row in items:
+            try:
+                out.append((row, name, build_event(
+                    row, fresh.get(str(row.get("tender_id") or "")), root, run_label,
+                    doc_fetcher, now_fn, lead_mail_version, folder_name=name), None, ""))
+            except Exception as exc:                              # noqa: BLE001
+                # Межа оркестратора: одна зламана подія не зупиняє решту.
+                out.append((row, name, None, exc, traceback.format_exc()))
+        return out
+
     summaries, failures = [], []
     if verbose:
         print(f"    документи рішень і картки: подій {len(rows)}…", flush=True)
+    done = 0
     with ThreadPoolExecutor(max_workers=workers or WORKERS) as pool:
-        futures = {pool.submit(build_event, row, fresh.get(str(row.get("tender_id") or "")),
-                               root, run_label, doc_fetcher, now_fn,
-                               lead_mail_version): row for row in rows}
-        for done, future in enumerate(as_completed(futures), 1):
-            row = futures[future]
-            try:
-                summary = future.result()
-            except Exception as exc:                              # noqa: BLE001
-                # Межа оркестратора: одна зламана подія не зупиняє решту.
-                trace = traceback.format_exc()
+        futures = [pool.submit(run_group, name, items) for name, items in groups.items()]
+        for row, name, summary, exc, trace in (
+                item for future in as_completed(futures) for item in future.result()):
+            done += 1
+            if summary is None:
                 failures.append((row, trace))
                 summary = {"ok": False, "day": event_day(row),
                            "ua_id": row.get("ua_id") or "",
@@ -2044,7 +2152,8 @@ def build_service_cards(rows: list, *, root: str, run_label: str,
                            "title": row.get("title") or "",
                            "lead_state": row.get("state") or "",
                            "error": f"CARD_FAILED: {type(exc).__name__}: {exc}"[:300],
-                           "folder": os.path.join(event_day(row), case_folder_name(row))}
+                           "folder": os.path.join(
+                               os.path.basename(os.path.normpath(root)), name)}
                 stats["карток"]["FAILED"] += 1
                 stats["помилки"].append(f"{row.get('ua_id')}: {type(exc).__name__}")
             else:
@@ -2064,16 +2173,18 @@ def build_service_cards(rows: list, *, root: str, run_label: str,
         by_day.setdefault(summary.get("day") or "bez-daty", []).append(summary)
     for day, items in sorted(by_day.items()):
         try:
-            stats["перелік"].append(write_index(os.path.join(root, day), run_label, items))
+            stats["перелік"].append(write_index(os.path.join(index_root, day),
+                                                run_label, items))
         except Exception as exc:                                  # noqa: BLE001
             stats["помилки"].append(f"перелік {day}: {type(exc).__name__}: {exc}")
 
     if failures:
-        log_path = os.path.join(root, f"_pomylky_{run_label}.log")
+        log_path = os.path.join(index_root, f"_pomylky_{run_label}.log")
         lines = [f"TenderWin Service Cards {VERSION} · прогін {run_label}\n"]
         for row, trace in failures:
             lines.append(f"\n=== {row.get('ua_id')} · подія {row.get('event_id')}\n{trace}")
         try:
+            os.makedirs(index_root, exist_ok=True)
             atomic_write(log_path, "".join(lines).encode("utf-8"))
             stats["журнал_помилок"] = log_path
         except OSError:
@@ -2115,7 +2226,7 @@ def summary_lines(stats: dict) -> list:
     shown = [f"{key.lower()}: {text[key]}" for key in order if text.get(key)]
     if shown:
         lines.append("Текст рішення по подіях — " + " · ".join(shown))
-    lines.append(f"Тека: {stats.get('тека')}")
+    lines.append(f"Теки справ (картка + протокол): {stats.get('тека')}")
     for path in stats.get("перелік", []):
         lines.append(f"Перелік для відбору: {path}")
     if stats.get("журнал_помилок"):

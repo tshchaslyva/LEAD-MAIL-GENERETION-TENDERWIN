@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
- TENDERWIN LEAD & MAIL v1.3.0 · ЛІДИ, ЛИСТИ І СЛУЖБОВІ КАРТКИ
+ TENDERWIN LEAD & MAIL v1.4.0 · ЛІДИ, ЛИСТИ І СЛУЖБОВІ КАРТКИ
 =============================================================================
 
  ЩО ЦЕ
@@ -53,6 +53,18 @@
    модуль           уся робота з документами — в окремому файлі
                     tenderwin_service_cards.py; без нього листи працюють
 
+ ЩО ЗМІНИЛОСЯ В 1.4.0 (рішення власника 06.10.2026)
+
+   теки справ       службова картка і протокол (рішення) замовника лягають
+                    у «Мій диск/0 Cases» (на компʼютері G:\\Мій диск\\0 Cases),
+                    у підтеку «<ID закупівлі> <ЄДРПОУ/ІПН учасника>»;
+                    перелік для відбору — як і раніше, у TenderWin/Службові
+                    картки/<дата>/
+   лист V9_OWNER    V8 з правками власника: новий абзац про зіставлення і
+                    про достатність аналізу, посилання на приклад аналізу
+                    замість «відповідайте на цей лист», підпис без
+                    посилань і з номером +380 800 357 135
+
  ЧОГО ТУТ НЕМАЄ СВІДОМО
 
    завантаження документів пропозиції і ТД · OCR · будь-який LLM ·
@@ -87,8 +99,8 @@ from zoneinfo import ZoneInfo
 import lead_machine_v1 as L                 # ядро: Prozorro, ПІБ, кличний
 import tenderwin_lead_engine as E           # перевірені шлюзи й доступ до Gmail
 
-VERSION = "1.3.0"
-BUILD = "2026-10-04"
+VERSION = "1.4.0"
+BUILD = "2026-10-06"
 SCHEMA_VERSION = 2
 
 # ============================================================================
@@ -208,13 +220,16 @@ HTTP_POOL_SIZE = 32
 
 # --- Листи ------------------------------------------------------------------
 # Незмінні версії. Активну перемикає один рядок.
-#   "V8_OWNER"   — ЧИННИЙ текст (23.09.2026): назва й код компанії, точні
+#   "V9_OWNER"   — ЧИННИЙ текст (06.10.2026): V8 з правками власника —
+#                  посилання на приклад аналізу, підпис без посилань,
+#                  телефон +380 800 357 135
+#   "V8_OWNER"   — текст 23.09.2026: назва й код компанії, точні
 #                  дата й час відхилення та строку оскарження
 #   "V7_OWNER"   — V6 з помʼякшеним реченням про самостійну скаргу
 #   "V6_OWNER"   — текст, затверджений 22.09.2026 (з HTML)
 #   "V4_OWNER"   — перший текст власника того самого дня
 #   "V5_REDTEAM" — редакція після red team (додаток А.2 майстер-промпту)
-LETTER_VERSION = "V8_OWNER"
+LETTER_VERSION = "V9_OWNER"
 
 #: Рядок про строк оскарження. Додається лише за наявності підтвердженої дати.
 SHOW_COMPLAINT_DEADLINE = True
@@ -230,8 +245,15 @@ LETTER_FORMAT = "HTML_AND_TEXT"
 #: у листі має бути саме сайт.
 SITE_URL = "https://tenderwin.in.ua"
 SITE_LABEL = "tenderwin.in.ua"
+#: Телефон у підписі версій V5–V8. У V9 підпис затверджений цілком, разом
+#: із номером +380 800 357 135, і записаний у самому шаблоні.
 PHONE_TEXT = "+380 50 310 14 92"
 PHONE_TEL = "+380503101492"
+
+#: V9: «Побачити, як виглядає мій аналіз, Ви можете тут: …». Сюди можна
+#: поставити сторінку з прикладом аналізу, коли вона буде на сайті.
+ANALYSIS_EXAMPLE_URL = SITE_URL
+ANALYSIS_EXAMPLE_LABEL = SITE_LABEL
 
 #: Рядок «відповідайте «стоп»». Вмикати лише тоді, коли відповіді реально
 #: читаються (у цій версії читання скриньки немає).
@@ -250,15 +272,31 @@ SERVICE_CARDS = True
 #: Перед завантаженням брати свіжий стан рішення з Prozorro: документи,
 #: додані після сканування, поточний статус рішення, скарги.
 SERVICE_CARDS_FRESH = True
-#: Назва теки службових карток усередині робочої теки TenderWin.
+#: Тека справ (рішення власника 06.10.2026): у ній на кожне відхилення
+#: підтека «<ID закупівлі> <ЄДРПОУ/ІПН учасника>» зі службовою карткою і
+#: протоколом (рішенням) замовника. Це «G:\Мій диск\0 Cases» на компʼютері
+#: і «/content/drive/MyDrive/0 Cases» у Colab — той самий «Мій диск».
+CASES_DIRNAME = "0 Cases"
+#: Повний шлях до теки справ, якщо треба інший. Порожньо — «0 Cases» у
+#: корені «Мого диска», знайденого автоматично (див. cases_root()).
+CASES_DIR = ""
+#: Як називається корінь «Мого диска» в шляху: Colab, Google Диск для
+#: компʼютера англійською й українською.
+MY_DRIVE_NAMES = ("MyDrive", "My Drive", "Мій диск")
+#: Де шукати «Мій диск», якщо робоча тека лежить не на ньому.
+MY_DRIVE_ROOTS = ("/content/drive/MyDrive", "G:\\Мій диск", "G:\\My Drive")
+#: Тека переліків для відбору (.xlsx) і журналів помилок карток — усередині
+#: робочої теки TenderWin, як і раніше. У «0 Cases» лежать лише справи.
 CARDS_DIRNAME = "Службові картки"
 
 # --- Де живе стан -----------------------------------------------------------
 DB_PATH = "tenderwin_lead_mail.db"
 OUT_DIR = "vyhid_lystiv"
-#: Тека службових карток. M.setup(DYSK) і M.go(dysk=DYSK) ставлять її
-#: всередину робочої теки на Диску.
+#: Тека переліків службових карток. M.setup(DYSK) і M.go(dysk=DYSK)
+#: ставлять її всередину робочої теки на Диску.
 CARDS_DIR = CARDS_DIRNAME
+#: Робоча тека TenderWin (DYSK), від якої шукається «Мій диск».
+WORK_DIR = ""
 #: База попереднього движка. Потрібна один раз, щоб не написати «перший»
 #: лист тим, кому вже писали.
 LEGACY_DB_PATH = "leads.db"
@@ -1952,7 +1990,7 @@ TEMPLATE_V7_OWNER = Template(
 )
 
 # ----------------------------------------------------------------------------
-#  V8_OWNER — ЧИННА ВЕРСІЯ (23.09.2026). Відмінності від V7:
+#  V8_OWNER — версія 23.09.2026 (чинна до V9). Відмінності від V7:
 #    * у першому реченні названо компанію і її код (ЄДРПОУ/ІПН);
 #    * дата й час відхилення повністю, а не лише день;
 #    * строк оскарження — теж із точним часом;
@@ -2059,9 +2097,120 @@ TEMPLATE_V8_OWNER = Template(
     ),
 )
 
+# ----------------------------------------------------------------------------
+#  V9_OWNER — ЧИННА ВЕРСІЯ (06.10.2026). V8 з правками власника:
+#    * абзац «Я зіставлю те, що написав Замовник…» — з документами Вашої
+#      тендерної пропозиції;
+#    * «Якщо підстави для скарги є, то складеного мною аналізу зазвичай
+#      Вам буде достатньо…» замість «Зазвичай цього достатньо…»;
+#    * «Побачити, як виглядає мій аналіз, Ви можете тут: …» з посиланням
+#      на сайт замість «Якщо питання актуальне — просто відповідайте…»;
+#    * підпис без посилань (ні «TenderWin», ні сайту, ні tel:) і з
+#      номером +380 800 357 135.
+#  HTML і текст містять ті самі слова.
+# ----------------------------------------------------------------------------
+TEMPLATE_V9_OWNER = Template(
+    version="V9_OWNER",
+    subject="Відхилення у закупівлі {ua_id}: чи є підстави для оскарження?",
+    body=(
+        "{greeting}\n"
+        "\n"
+        "{rejection_block}\n"
+        "\n"
+        "Питання після такого рішення зазвичай одне: чи справді підстави були "
+        "і чи варто витрачати гроші на оскарження.\n"
+        "\n"
+        "Дам на нього дуже детальну письмову відповідь:\n"
+        "\n"
+        "• чи були підстави для відхилення,\n"
+        "• які ризики,\n"
+        "• що доцільно робити далі.\n"
+        "\n"
+        "Я зіставлю те, що написав Замовник у рішенні, з вимогами тендерної "
+        "документації, документами Вашої тендерної пропозиції та практикою "
+        "АМКУ. Якщо підстав для скарги немає, напишу про це прямо.\n"
+        "\n"
+        "Якщо підстави для скарги є, то складеного мною аналізу зазвичай Вам "
+        "буде достатньо, щоб самостійно подати скаргу в АМКУ, не витрачаючи "
+        "зайвих коштів на юридичний супровід.\n"
+        "\n"
+        "Вартість — 3 499 грн за одне рішення про відхилення, з усіма підставами, "
+        "які в ньому названі.\n"
+        "Висновок — протягом 24 годин після оплати.\n"
+        "{deadline_block}"
+        "\n"
+        "Побачити, як виглядає мій аналіз, Ви можете тут: {example_url}\n"
+        "\n"
+        "З повагою,\n"
+        "Віталій Щасливий\n"
+        "радник з публічних закупівель\n"
+        "+380 800 357 135\n"
+        "{opt_out_block}"
+    ),
+    html=(
+        '<!DOCTYPE html>\n'
+        '<html lang="uk"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta name="color-scheme" content="light">'
+        '<meta name="supported-color-schemes" content="light">'
+        '</head>\n'
+        '<body style="margin:0;padding:0;background:#ffffff;">\n'
+        '<div style="max-width:620px;margin:0;padding:18px 20px;'
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,"
+        'Helvetica,sans-serif;font-size:16px;line-height:1.6;color:#1f2328;'
+        'background:#ffffff;">\n'
+
+        '<p style="margin:0 0 16px 0;">{greeting}</p>\n'
+
+        '<p style="margin:0 0 16px 0;">{rejection_block_html}</p>\n'
+
+        '<p style="margin:0 0 16px 0;">Питання після такого рішення зазвичай '
+        'одне: чи справді підстави були і чи варто витрачати гроші на '
+        'оскарження.</p>\n'
+
+        '<p style="margin:0 0 8px 0;">Дам на нього дуже детальну письмову '
+        'відповідь:</p>\n'
+        '<ul style="margin:0 0 16px 0;padding-left:22px;">'
+        '<li style="margin:0 0 6px 0;">чи були підстави для відхилення,</li>'
+        '<li style="margin:0 0 6px 0;">які ризики,</li>'
+        '<li style="margin:0;">що доцільно робити далі.</li></ul>\n'
+
+        '<p style="margin:0 0 16px 0;">Я зіставлю те, що написав Замовник у '
+        'рішенні, з вимогами тендерної документації, документами Вашої '
+        'тендерної пропозиції та практикою АМКУ. Якщо підстав для скарги '
+        'немає, напишу про це прямо.</p>\n'
+
+        '<p style="margin:0 0 16px 0;">Якщо підстави для скарги є, то '
+        'складеного мною аналізу зазвичай Вам буде достатньо, щоб самостійно '
+        'подати скаргу в АМКУ, не витрачаючи зайвих коштів на юридичний '
+        'супровід.</p>\n'
+
+        '<div style="margin:0 0 16px 0;padding:12px 14px;background:#f6f8fa;'
+        'border-left:3px solid #c9d1d9;">\n'
+        '<p style="margin:0;"><strong>Вартість — 3 499 грн</strong> за одне '
+        'рішення про відхилення, з усіма підставами, які в ньому названі.<br>'
+        'Висновок — <strong>протягом 24 годин після оплати</strong>.</p>\n'
+        '{deadline_html}'
+        '</div>\n'
+
+        '<p style="margin:0 0 18px 0;">Побачити, як виглядає мій аналіз, Ви '
+        'можете тут: <a href="{example_url}" style="color:#0a58ca;">'
+        '{example_label}</a></p>\n'
+
+        '<p style="margin:0;font-size:15px;line-height:1.5;color:#3a4149;">'
+        'З повагою,<br>'
+        '<strong>Віталій Щасливий</strong><br>'
+        'радник з публічних закупівель<br>'
+        '+380 800 357 135'
+        '</p>\n'
+        '{opt_out_html}'
+        '</div></body></html>'
+    ),
+)
+
 ALL_TEMPLATES = {t.version: t for t in (TEMPLATE_V4_OWNER, TEMPLATE_V5_REDTEAM,
                                         TEMPLATE_V6_OWNER, TEMPLATE_V7_OWNER,
-                                        TEMPLATE_V8_OWNER)}
+                                        TEMPLATE_V8_OWNER, TEMPLATE_V9_OWNER)}
 
 
 def active_template() -> Template:
@@ -2237,6 +2386,7 @@ def render_letter(events: list, greeting: str,
                           if SHOW_OPT_OUT_LINE else ""),
         "phone_text": PHONE_TEXT,
         "site_label": SITE_LABEL,
+        "example_url": ANALYSIS_EXAMPLE_URL,
     }
     if "{rejection_block}" in tpl.body and not all(
             getattr(ev, "event_time", None) for ev in events):
@@ -2288,6 +2438,8 @@ def render_html(tpl: Template, ctx: dict, events: list,
         "site_label": SITE_LABEL,
         "phone_text": PHONE_TEXT,
         "phone_tel": PHONE_TEL,
+        "example_url": esc(ANALYSIS_EXAMPLE_URL),
+        "example_label": esc(ANALYSIS_EXAMPLE_LABEL),
     }
     return tpl.html.format(**html_ctx)
 
@@ -2959,7 +3111,8 @@ class LeadMail:
             widen_pool(session)
             doc_fetcher = SC.HttpDocFetcher(session=session)
         stats = SC.build_service_cards(
-            rows, root=CARDS_DIR, run_label=label or run_id or self.run_id,
+            rows, root=cases_root(), index_root=CARDS_DIR,
+            run_label=label or run_id or self.run_id,
             tender_fetcher=(client.tender if (client is not None and use_fresh)
                             else None),
             doc_fetcher=doc_fetcher, verbose=self.verbose,
@@ -3020,16 +3173,44 @@ def _paths(dysk: str = "") -> None:
     знайшов би `.gmail_token.json`, який лежить поруч із базою, і сказав
     би «немає доступу до пошти», хоча доступ є.
     """
-    global DB_PATH, OUT_DIR, LEGACY_DB_PATH, CARDS_DIR
+    global DB_PATH, OUT_DIR, LEGACY_DB_PATH, CARDS_DIR, WORK_DIR
     if dysk:
         DB_PATH = os.path.join(dysk, "tenderwin_lead_mail.db")
         OUT_DIR = os.path.join(dysk, "vyhid_lystiv")
         LEGACY_DB_PATH = os.path.join(dysk, "leads.db")
         CARDS_DIR = os.path.join(dysk, CARDS_DIRNAME)
+        WORK_DIR = dysk
         E.TOKEN_DIR = dysk
         return
     if not E.TOKEN_DIR:
         E.TOKEN_DIR = os.path.dirname(os.path.abspath(DB_PATH)) or os.getcwd()
+
+
+def cases_root() -> str:
+    """
+    Тека справ «0 Cases» у корені «Мого диска».
+
+    Порядок пошуку: явний CASES_DIR → «Мій диск» серед батьківських тек
+    робочої теки (у Colab це /content/drive/MyDrive) → відомі точки
+    монтування (G:\\Мій диск на компʼютері) → «0 Cases» усередині робочої
+    теки, якщо Диска не видно зовсім.
+    """
+    if CASES_DIR:
+        return CASES_DIR
+    start = os.path.abspath(WORK_DIR or os.path.dirname(os.path.abspath(DB_PATH))
+                            or os.getcwd())
+    path = start
+    while True:
+        if os.path.basename(path) in MY_DRIVE_NAMES:
+            return os.path.join(path, CASES_DIRNAME)
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    for root in MY_DRIVE_ROOTS:
+        if os.path.isdir(root):
+            return os.path.join(root, CASES_DIRNAME)
+    return os.path.join(start, CASES_DIRNAME)
 
 
 def gmail_secret_ready(dysk: str = "") -> tuple[bool, str]:
@@ -3075,6 +3256,8 @@ def setup(dysk: str = "", legacy_db: str = "") -> dict:
         stats = engine.prepare(legacy_db or LEGACY_DB_PATH)
         print(f"  база: {DB_PATH}")
         print(f"  вихід: {OUT_DIR}")
+        if SERVICE_CARDS:
+            print(f"  справи (картка + протокол): {cases_root()}")
         print(f"  тестових адрес у білому списку: {stats['тестових_адрес']}")
         legacy = stats["перенесено_з_движка"]
         if isinstance(legacy, dict):
@@ -3360,7 +3543,7 @@ def tests(folder: str = "") -> None:
     """Прогін тестів цього скрипта і модуля службових карток."""
     import subprocess, sys                                      # noqa: PLC0415
     folder = folder or os.path.dirname(os.path.abspath(__file__))
-    for name in ("test_lead_mail.py", "test_service_cards.py"):
+    for name in ("test_lead_mail.py", "test_service_cards.py", "test_0_cases.py"):
         path = os.path.join(folder, name)
         if not os.path.exists(path):
             print(f"  Не знайдено {path}")
