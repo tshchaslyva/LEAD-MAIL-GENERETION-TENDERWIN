@@ -7,7 +7,7 @@
   * обмеження діє лише після бойового листа (у черзі, надісланого,
     з невідомим станом); скасований і невдалий компанію не блокують;
   * подія, яку бачив лише тестовий прогін, у бойовому знову йде в розсилку;
-  * відправка клієнтам — лише після «ТАК»;
+  * відправка клієнтам — одразу, без запитання (рішення власника 08.10.2026);
   * лист V10 — V9 з телефоном «0 800 357 135».
 
 Мережі й Gmail немає. Запуск:  python3 test_live.py  (поруч із test_lead_mail.py)
@@ -259,31 +259,18 @@ class TestLiveSend(LiveBase):
             out = M.send(paced=False, **kw)
         return out, buf.getvalue()
 
-    def test_nothing_goes_without_yes(self):
-        self.build([t_one()])
-        out, text = self.send(confirm="ні")
-        self.assertEqual(out["причина"], "не підтверджено")
-        self.assertEqual(self.fake.sent, [])
-        self.assertEqual(self.letters()[0]["status"], "QUEUED")
-        self.assertIn(CLIENT, text)               # людина бачила, кому піде
-
-    def test_no_keyboard_means_no(self):
+    def test_live_send_goes_to_the_client_without_asking(self):
+        """Ні запитання, ні очікування клавіатури: «Виконати всі» теж надсилає."""
         self.build([t_one()])
         real_input = builtins.input
 
-        def no_keyboard(prompt=""):
-            raise EOFError
-        builtins.input = no_keyboard
+        def no_questions(prompt=""):
+            raise AssertionError("відправка не має нічого питати")
+        builtins.input = no_questions
         try:
-            out, _ = self.send()
+            out, text = self.send()
         finally:
             builtins.input = real_input
-        self.assertEqual(out["причина"], "не підтверджено")
-        self.assertEqual(self.fake.sent, [])
-
-    def test_yes_sends_to_the_client(self):
-        self.build([t_one()])
-        out, text = self.send(confirm="так")
         self.assertEqual(len(self.fake.sent), 1)
         import email                                              # noqa: PLC0415
         from email import policy                                  # noqa: PLC0415
@@ -293,22 +280,20 @@ class TestLiveSend(LiveBase):
         self.assertIn("0 800 357 135", msg.get_body(("plain",)).get_content())
         self.assertIn("0 800 357 135", msg.get_body(("html",)).get_content())
         self.assertEqual(self.letters()[0]["status"], "SENT_CONFIRMED")
-        self.assertIn("БОЙОВА ВІДПРАВКА", text)
+        self.assertIn(f"→ {CLIENT}", text)              # у звіті видно, кому пішов
 
-    def test_confirmation_lists_exactly_what_is_sent(self):
+    def test_rest_of_the_queue_goes_with_the_next_run(self):
         self.build([t_one(), t_one(uid="t2", ua="UA-2026-09-02-000002-a", hour=15,
                                    code="87654321", name="ТОВ «ІНША»",
                                    email="info@insha.example")])
-        out, text = self.send(confirm="ТАК", max_sends=1)
+        _, text = self.send(max_sends=1)
         self.assertEqual(len(self.fake.sent), 1)
-        sent_to = [r["delivery_email_actual"] for r in self.letters()
-                   if r["status"] == "SENT_CONFIRMED"]
-        self.assertEqual(len(sent_to), 1)
-        import re                                                 # noqa: PLC0415
-        listed = [line for line in text.splitlines() if re.match(r"\s+\d+\. ", line)]
-        self.assertEqual(len(listed), 1)
-        self.assertIn(sent_to[0], listed[0])
-        self.assertIn("ще 1", text)               # решта — наступним запуском
+        self.assertIn("ще 1", text)                      # решта — наступним запуском
+        self.send(max_sends=1)
+        self.assertEqual(len(self.fake.sent), 2)
+        sent_to = sorted(r["delivery_email_actual"] for r in self.letters())
+        self.assertEqual(sent_to, sorted([CLIENT, "info@insha.example"]))
+        self.assertTrue(all(r["status"] == "SENT_CONFIRMED" for r in self.letters()))
 
     def test_setup_works_without_test_boxes(self):
         M.TEST_RECIPIENTS = []

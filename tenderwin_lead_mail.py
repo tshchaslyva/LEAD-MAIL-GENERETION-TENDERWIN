@@ -21,9 +21,8 @@
     історії попереднього движка.
  3. Лист іде лише туди, куди дозволяє режим, і це перевіряє тригер бази:
     TEST — тільки на адреси зі списку TEST_RECIPIENTS; LIVE (з 1.5.0) —
-    тільки на адресу самої компанії з Prozorro і лише після підтвердження
-    «ТАК» перед відправкою. Тестові листи не займають бойового першого
-    листа.
+    тільки на адресу самої компанії з Prozorro. Тестові листи не займають
+    бойового першого листа.
  4. Завантажуються ЛИШЕ документи самого рішення замовника (протокол,
     повідомлення про невідповідності) — для службової картки. Документи
     пропозиції і тендерна документація не завантажуються: у робочій картці
@@ -73,8 +72,7 @@
    бойовий режим    MODE = "LIVE": лист іде на адресу компанії з Prozorro.
                     Усі попередні листи були тестовими і бойового першого
                     листа не займають; обмеження діє лише після бойового.
-                    Тригер бази не пускає бойовий лист на іншу адресу,
-                    M.send() перед бойовою відправкою просить «ТАК».
+                    Тригер бази не пускає бойовий лист на іншу адресу.
    події з тесту    подія, яку вже бачив тестовий прогін, у бойовому
                     прогоні знову йде в розсилку (якщо вона у вікні)
    адреса           e-mail із помилкою — на ручний перегляд, не в розсилку
@@ -126,7 +124,7 @@ SCHEMA_VERSION = 2
 #   "TEST" — листи йдуть лише на ваші скриньки з TEST_RECIPIENTS;
 #   "LIVE" — бойовий (з 1.5.0, рішення власника 08.10.2026): лист іде на
 #            адресу самої компанії з Prozorro. Тестові листи бойового першого
-#            листа не займають. Перед відправкою M.send() просить «ТАК».
+#            листа не займають. Надсилає M.send() (клітинка 7) одразу.
 # Тут — безпечне значення за замовчуванням; бойовий режим вмикає ноутбук
 # (клітинка 5) одним рядком M.MODE = "LIVE".
 MODE = "TEST"
@@ -3051,8 +3049,7 @@ class LeadMail:
     # --- крок 6: відправка ------------------------------------------------------
     def send(self, transport=None, max_sends: Optional[int] = None,
              paced: bool = True) -> dict:
-        """TEST — на тестові скриньки; LIVE — клієнтам. Підтвердження «ТАК»
-        для бойової відправки питає M.send(), а не цей метод."""
+        """TEST — на тестові скриньки; LIVE — клієнтам."""
         if MODE not in ("TEST", "LIVE"):
             raise ERR["MODE_UNKNOWN"](MODE)
         if MODE == "TEST" and not self.db.q("SELECT email FROM test_allowlist LIMIT 1"):
@@ -3373,7 +3370,7 @@ def setup(dysk: str = "", legacy_db: str = "") -> dict:
             print(f"  справи (картка + протокол): {cases_root()}")
         if MODE == "LIVE":
             print("  БОЙОВИЙ РЕЖИМ: листи складаються на адреси компаній із Prozorro.")
-            print("  Надсилає лише M.send() — і лише після вашого «ТАК».")
+            print("  Надсилає M.send() (клітинка 7) — одразу, без запитань.")
             print("  Тестові листи бойового першого листа не займають.")
         else:
             print(f"  тестових адрес у білому списку: {stats['тестових_адрес']}")
@@ -3507,56 +3504,12 @@ def _service_cards_step(engine: "LeadMail", *, run_id: Optional[str] = None,
     return stats
 
 
-def _ask(prompt: str) -> str:
-    """Відповідь людини. Без клавіатури (фоновий запуск) — порожньо, тобто «ні»."""
-    try:
-        return input(prompt)
-    except (EOFError, OSError, RuntimeError):
-        return ""
-
-
-def confirm_live(engine: "LeadMail", batch_id: str, max_sends: Optional[int],
-                 answer: Optional[str] = None) -> bool:
-    """
-    Підтвердження бойової відправки. Показує, КОМУ саме зараз підуть листи,
-    і чекає «ТАК». Без нього — нічого не надсилається: «Виконати всі» в
-    Colab не може розіслати листи клієнтам випадково.
-    """
-    limit = max_sends or MAX_SENDS_PER_RUN
-    upcoming = engine.repo.queued(batch_id, limit)
-    total = engine.db.one("SELECT COUNT(*) n FROM outreach WHERE status = 'QUEUED'"
-                          " AND mode = 'LIVE' AND batch_id = ?", (batch_id,))["n"]
-    names = {r["company_id"]: (r["company_name"], r["edrpou_norm"]) for r in engine.db.q(
-        "SELECT company_id, company_name, edrpou_norm FROM companies WHERE company_id IN"
-        " (SELECT company_id FROM outreach WHERE status = 'QUEUED' AND mode = 'LIVE'"
-        "   AND batch_id = ?)", (batch_id,))}
-    хвилин = round(max(0, len(upcoming) - 1)
-                   * (MIN_SEND_DELAY_SECONDS + MAX_SEND_DELAY_SECONDS) / 2 / 60)
-    print("\n  " + "!" * 74)
-    print("  БОЙОВА ВІДПРАВКА: листи підуть КЛІЄНТАМ, на адреси з Prozorro.")
-    print(f"  У черзі партії {batch_id}: {total}. Зараз буде надіслано: {len(upcoming)}"
-          + (f" (решта {total - len(upcoming)} — наступним запуском)"
-             if total > len(upcoming) else "")
-          + (f", ≈ {хвилин} хв із паузами" if хвилин else "") + ".")
-    for номер, row in enumerate(upcoming, 1):
-        назва, код = names.get(row["company_id"], ("", ""))
-        print(f"   {номер:>3}. {назва} ({код}) → {row['delivery_email_actual']}")
-    print("  " + "!" * 74)
-    if answer is None:
-        answer = _ask("  Надіслати ці листи клієнтам? Напишіть ТАК і натисніть Enter: ")
-    ok = str(answer or "").strip().upper() == "ТАК"
-    engine.repo.audit("batch", batch_id, "LIVE_SEND_CONFIRMED" if ok else
-                      "LIVE_SEND_DECLINED", {"листів": len(upcoming)})
-    if not ok:
-        print("  Скасовано: нічого не надіслано. Листи лишаються в черзі.")
-    return ok
-
-
 def send(dysk: str = "", max_sends: Optional[int] = None, paced: bool = True,
-         batch: str = "", force: bool = False, confirm: Optional[str] = None) -> dict:
+         batch: str = "", force: bool = False) -> dict:
     """
     Відправка складених листів. TEST — на ВАШІ тестові скриньки; LIVE —
-    клієнтам, після підтвердження «ТАК» (confirm="ТАК" — без запитання).
+    клієнтам, на адреси компаній із Prozorro (рішення власника 08.10.2026:
+    без додаткового підтвердження).
     """
     _paths(dysk)
     _header("відправка КЛІЄНТАМ" if MODE == "LIVE" else "відправка на тестові скриньки")
@@ -3590,8 +3543,6 @@ def send(dysk: str = "", max_sends: Optional[int] = None, paced: bool = True,
                   "надіслати старі, M.send(force=True).")
             return {"надіслано": 0, "причина": "партія іншого дня"}
         engine.batch_id, engine.run_id = row["batch_id"], row["run_id"]
-        if MODE == "LIVE" and not confirm_live(engine, row["batch_id"], max_sends, confirm):
-            return {"надіслано": 0, "причина": "не підтверджено"}
         stats = engine.send(max_sends=max_sends, paced=paced)
         stats["звірка"] = engine.reconcile()
         print(f"\n  Підсумок: {stats}")
@@ -3718,8 +3669,8 @@ def _print_report(engine: LeadMail, window: Window, result: ScanResult,
               "рішень не завантажувались.")
     if MODE == "LIVE":
         print("\n  БОЙОВИЙ РЕЖИМ: листи складено на адреси КЛІЄНТІВ (поки лише у файли).")
-        print("  Далі: прочитайте кілька листів у теці eml, потім M.send() — він покаже,")
-        print("  кому саме підуть листи, і попросить «ТАК».")
+        print("  Далі: прочитайте кілька листів у теці eml, потім M.send() —")
+        print("  листи підуть клієнтам одразу.")
     else:
         print(f"\n  Далі: прочитайте кілька листів у теці eml, потім M.send().")
 
