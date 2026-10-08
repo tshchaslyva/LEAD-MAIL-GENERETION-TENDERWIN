@@ -887,7 +887,11 @@ class TestLetterV8(Base):
 
 
 class TestLetterV9(Base):
-    """Чинний лист V9 (06.10.2026): V8 з правками власника."""
+    """Лист V9 (06.10.2026): V8 з правками власника. Заморожена версія."""
+
+    def setUp(self):
+        super().setUp()
+        M.LETTER_VERSION = "V9_OWNER"
 
     def лист(self, cp_end=None, title="Капітальний ремонт покрівлі"):
         t = tender(bids=[bid("b1")],
@@ -900,8 +904,7 @@ class TestLetterV9(Base):
         eng.close()
         return row
 
-    def test_v9_is_the_active_letter(self):
-        self.assertEqual(M.LETTER_VERSION, "V9_OWNER")
+    def test_v9_still_renders_when_chosen(self):
         self.assertEqual(self.лист()["template_version"], "V9_OWNER")
 
     def test_text_matches_the_approved_wording(self):
@@ -1272,11 +1275,18 @@ class TestTestMode(Base):
         second = M.delivery_address("company-1", M.TEST_RECIPIENTS)
         self.assertEqual(first, second)
 
-    def test_live_mode_has_no_path(self):
+    def test_live_mode_still_needs_mail_access(self):
+        """З 1.5.0 бойовий режим є, але без доступу до пошти транспорту немає."""
         M.MODE = "LIVE"
         with self.assertRaises(M.MailError) as ctx:
             M.make_transport(dry_run=False, out_dir=self.tmp)
-        self.assertEqual(ctx.exception.code, "LIVE_NOT_IMPLEMENTED")
+        self.assertEqual(ctx.exception.code, "TRANSPORT_UNAVAILABLE")
+
+    def test_unknown_mode_stops(self):
+        M.MODE = "PROD"
+        with self.assertRaises(M.MailError) as ctx:
+            M.make_transport(dry_run=False, out_dir=self.tmp)
+        self.assertEqual(ctx.exception.code, "MODE_UNKNOWN")
 
 
 class TestSending(Base):

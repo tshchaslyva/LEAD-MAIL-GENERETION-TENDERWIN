@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
- TENDERWIN LEAD & MAIL v1.4.0 · ЛІДИ, ЛИСТИ І СЛУЖБОВІ КАРТКИ
+ TENDERWIN LEAD & MAIL v1.5.0 · ЛІДИ, ЛИСТИ І СЛУЖБОВІ КАРТКИ
 =============================================================================
 
  ЩО ЦЕ
@@ -19,8 +19,11 @@
     чи відхилення іншого учасника.
  2. Одна компанія отримує один перший лист. Назавжди, з урахуванням
     історії попереднього движка.
- 3. Жоден лист не піде на адресу клієнта: у цій версії є лише тестовий
-    режим, і доставка можлива тільки на адреси зі списку TEST_RECIPIENTS.
+ 3. Лист іде лише туди, куди дозволяє режим, і це перевіряє тригер бази:
+    TEST — тільки на адреси зі списку TEST_RECIPIENTS; LIVE (з 1.5.0) —
+    тільки на адресу самої компанії з Prozorro і лише після підтвердження
+    «ТАК» перед відправкою. Тестові листи не займають бойового першого
+    листа.
  4. Завантажуються ЛИШЕ документи самого рішення замовника (протокол,
     повідомлення про невідповідності) — для службової картки. Документи
     пропозиції і тендерна документація не завантажуються: у робочій картці
@@ -65,6 +68,18 @@
                     замість «відповідайте на цей лист», підпис без
                     посилань і з номером +380 800 357 135
 
+ ЩО ЗМІНИЛОСЯ В 1.5.0 (рішення власника 08.10.2026)
+
+   бойовий режим    MODE = "LIVE": лист іде на адресу компанії з Prozorro.
+                    Усі попередні листи були тестовими і бойового першого
+                    листа не займають; обмеження діє лише після бойового.
+                    Тригер бази не пускає бойовий лист на іншу адресу,
+                    M.send() перед бойовою відправкою просить «ТАК».
+   події з тесту    подія, яку вже бачив тестовий прогін, у бойовому
+                    прогоні знову йде в розсилку (якщо вона у вікні)
+   адреса           e-mail із помилкою — на ручний перегляд, не в розсилку
+   лист V10_OWNER   V9 з телефоном «0 800 357 135»
+
  ЧОГО ТУТ НЕМАЄ СВІДОМО
 
    завантаження документів пропозиції і ТД · OCR · будь-який LLM ·
@@ -75,7 +90,7 @@
    M.setup(DYSK)    один раз за сеанс: база, токен, перевірки
    M.go()           сухий прогін: шукає, складає листи у файли, службові картки
    M.kartky()       службові картки ще раз (за прогін або за день)
-   M.send()         відправка на ВАШІ тестові скриньки
+   M.send()         відправка: TEST — на ваші скриньки, LIVE — клієнтам
    M.state()        що зараз у базі
 =============================================================================
 """
@@ -99,8 +114,8 @@ from zoneinfo import ZoneInfo
 import lead_machine_v1 as L                 # ядро: Prozorro, ПІБ, кличний
 import tenderwin_lead_engine as E           # перевірені шлюзи й доступ до Gmail
 
-VERSION = "1.4.0"
-BUILD = "2026-10-06"
+VERSION = "1.5.0"
+BUILD = "2026-10-08"
 SCHEMA_VERSION = 2
 
 # ============================================================================
@@ -108,13 +123,17 @@ SCHEMA_VERSION = 2
 # ============================================================================
 
 # --- Режим ------------------------------------------------------------------
-# У цій версії реалізовано ТІЛЬКИ тестовий режим. Бойова відправка не має
-# жодного шляху в коді: щоб її ввімкнути, потрібна окрема фаза і окреме
-# рішення власника.
+#   "TEST" — листи йдуть лише на ваші скриньки з TEST_RECIPIENTS;
+#   "LIVE" — бойовий (з 1.5.0, рішення власника 08.10.2026): лист іде на
+#            адресу самої компанії з Prozorro. Тестові листи бойового першого
+#            листа не займають. Перед відправкою M.send() просить «ТАК».
+# Тут — безпечне значення за замовчуванням; бойовий режим вмикає ноутбук
+# (клітинка 5) одним рядком M.MODE = "LIVE".
 MODE = "TEST"
 
 #: Куди дозволено доставляти листи в тестовому режимі. Порожній список
-#: зупиняє роботу — це стан спокою, а не привід написати клієнтам.
+#: зупиняє тестову роботу — це стан спокою, а не привід написати клієнтам.
+#: У бойовому режимі цей список не використовується.
 TEST_RECIPIENTS = [
     "ppvetik1@gmail.com",
     "mike.vital.llc@gmail.com",
@@ -220,8 +239,9 @@ HTTP_POOL_SIZE = 32
 
 # --- Листи ------------------------------------------------------------------
 # Незмінні версії. Активну перемикає один рядок.
-#   "V9_OWNER"   — ЧИННИЙ текст (06.10.2026): V8 з правками власника —
-#                  посилання на приклад аналізу, підпис без посилань,
+#   "V10_OWNER"  — ЧИННИЙ текст (08.10.2026): V9 з телефоном «0 800 357 135»
+#   "V9_OWNER"   — текст 06.10.2026: V8 з правками власника — посилання
+#                  на приклад аналізу, підпис без посилань,
 #                  телефон +380 800 357 135
 #   "V8_OWNER"   — текст 23.09.2026: назва й код компанії, точні
 #                  дата й час відхилення та строку оскарження
@@ -229,7 +249,7 @@ HTTP_POOL_SIZE = 32
 #   "V6_OWNER"   — текст, затверджений 22.09.2026 (з HTML)
 #   "V4_OWNER"   — перший текст власника того самого дня
 #   "V5_REDTEAM" — редакція після red team (додаток А.2 майстер-промпту)
-LETTER_VERSION = "V9_OWNER"
+LETTER_VERSION = "V10_OWNER"
 
 #: Рядок про строк оскарження. Додається лише за наявності підтвердженої дати.
 SHOW_COMPLAINT_DEADLINE = True
@@ -482,11 +502,14 @@ def _err(code, what, affected, may_continue, next_step) -> MailError:
 
 
 ERR = {
-    "LIVE_NOT_IMPLEMENTED": lambda: _err(
-        "LIVE_NOT_IMPLEMENTED", "Бойовий режим у цій версії не реалізовано",
-        "Уся відправка", False,
-        "Ця версія надсилає листи лише на адреси з TEST_RECIPIENTS. "
-        "Бойовий режим — окрема фаза і окреме рішення власника."),
+    "MODE_UNKNOWN": lambda m: _err(
+        "MODE_UNKNOWN", f"Невідомий режим «{m}»",
+        "Уся робота", False, 'Допустимо лише MODE = "TEST" або MODE = "LIVE".'),
+    "LIVE_DELIVERY_NOT_CONTACT": lambda a: _err(
+        "LIVE_DELIVERY_NOT_CONTACT", f"Бойовий лист не на адресу компанії: «{a}»",
+        "Один лист, НЕ складено", True,
+        "Спрацював запобіжник бази: у бойовому режимі лист іде лише на "
+        "адресу самої компанії з Prozorro."),
     "TEST_ALLOWLIST_EMPTY": lambda: _err(
         "TEST_ALLOWLIST_EMPTY", "Список тестових адрес порожній",
         "Уся відправка", False,
@@ -722,6 +745,24 @@ WHEN NEW.mode = 'TEST'
  AND NEW.delivery_email_actual NOT IN (SELECT email FROM test_allowlist)
 BEGIN SELECT RAISE(ABORT, 'TEST_RECIPIENT_NOT_ALLOWED'); END;
 
+-- У бойовому режимі лист іде ЛИШЕ на адресу самої компанії (з Prozorro):
+-- адреса доставки дорівнює адресі контакту, і вона схожа на e-mail.
+CREATE TRIGGER trg_live_delivery_is_contact BEFORE INSERT ON outreach
+WHEN NEW.mode = 'LIVE'
+ AND NEW.status NOT IN ('MIGRATED_UNVERIFIED', 'LEGACY_SENT')
+ AND (NEW.contact_email_original IS NULL
+      OR lower(NEW.delivery_email_actual) <> lower(NEW.contact_email_original)
+      OR NEW.delivery_email_actual NOT LIKE '_%@_%._%')
+BEGIN SELECT RAISE(ABORT, 'LIVE_DELIVERY_NOT_CONTACT'); END;
+
+CREATE TRIGGER trg_live_delivery_is_contact_update BEFORE UPDATE ON outreach
+WHEN NEW.mode = 'LIVE'
+ AND NEW.status NOT IN ('MIGRATED_UNVERIFIED', 'LEGACY_SENT')
+ AND (NEW.contact_email_original IS NULL
+      OR lower(NEW.delivery_email_actual) <> lower(NEW.contact_email_original)
+      OR NEW.delivery_email_actual NOT LIKE '_%@_%._%')
+BEGIN SELECT RAISE(ABORT, 'LIVE_DELIVERY_NOT_CONTACT'); END;
+
 -- Адреса доставки визначається один раз, під час складання листа.
 CREATE TRIGGER trg_delivery_address_immutable BEFORE UPDATE OF delivery_email_actual
 ON outreach
@@ -791,7 +832,9 @@ class Db:
         have = {r["name"] for r in self.q(
             "SELECT name FROM sqlite_master WHERE type = 'trigger'")}
         for name in ("trg_test_mode_fail_closed_update",
-                     "trg_delivery_address_immutable"):
+                     "trg_delivery_address_immutable",
+                     "trg_live_delivery_is_contact",
+                     "trg_live_delivery_is_contact_update"):
             if name in have:
                 continue
             block = SCHEMA_SQL.split(f"CREATE TRIGGER {name}")[1].split("END;")[0]
@@ -818,6 +861,7 @@ class Repo:
 
     def __init__(self, db: Db):
         self.db = db
+        self.rearmed = 0          # подій, повернутих із тестових прогонів
 
     # --- журнал -------------------------------------------------------------
     def audit(self, entity: str, entity_id: str, event: str, payload: dict | None = None):
@@ -895,15 +939,29 @@ class Repo:
     def event(self, facts: "Rejection", tender_id: str, company_id: str,
               run_id: str) -> tuple[str, bool]:
         row = self.db.one(
-            "SELECT event_id FROM events WHERE tender_id = ? AND stage = ?"
-            "   AND object_id = ? AND COALESCE(bid_id,'') = ?"
-            "   AND COALESCE(lot_id,'') = ?",
+            "SELECT e.event_id, e.run_id, r.mode AS run_mode FROM events e"
+            "  LEFT JOIN runs r ON r.run_id = e.run_id"
+            " WHERE e.tender_id = ? AND e.stage = ?"
+            "   AND e.object_id = ? AND COALESCE(e.bid_id,'') = ?"
+            "   AND COALESCE(e.lot_id,'') = ?",
             (tender_id, facts.stage, facts.object_id, facts.bid_id or "",
              facts.lot_id or ""))
         if row:
             self.db.x("UPDATE events SET object_status = ?, status_checked_at = ?"
                       " WHERE event_id = ?",
                       (facts.object_status, now_iso(), row["event_id"]))
+            if MODE == "LIVE" and (row["run_mode"] or "TEST") != "LIVE" \
+                    and row["run_id"] != run_id:
+                # Подію раніше бачив лише тестовий прогін: тестові рішення
+                # («вже писали», «у листі») для бойової розсилки не діють.
+                # Подія знову нова — але лише тому, що вона в поточному вікні.
+                self.db.x("UPDATE events SET run_id = ?, state = 'NEW',"
+                          " state_reason = NULL WHERE event_id = ?",
+                          (run_id, row["event_id"]))
+                self.audit("event", row["event_id"], "EVENT_REARMED_FOR_LIVE",
+                           {"was_run": row["run_id"], "run": run_id})
+                self.rearmed += 1
+                return row["event_id"], True
             return row["event_id"], False
         eid = new_id()
         self.db.x(
@@ -985,6 +1043,8 @@ class Repo:
             text = str(exc)
             if "TEST_RECIPIENT_NOT_ALLOWED" in text:
                 raise ERR["TEST_RECIPIENT_NOT_ALLOWED"](draft.delivery_email) from exc
+            if "LIVE_DELIVERY_NOT_CONTACT" in text:
+                raise ERR["LIVE_DELIVERY_NOT_CONTACT"](draft.delivery_email) from exc
             if "COMPANY_SUPPRESSED" in text:
                 raise _err("COMPANY_SUPPRESSED", "Компанія у стоп-листі",
                            "Один лід", True, "Автоматичні звернення заборонені.") from exc
@@ -1013,7 +1073,7 @@ class Repo:
     def queued(self, batch_id: str, limit: int) -> list:
         return self.db.q(
             "SELECT * FROM outreach WHERE status = 'QUEUED' AND mode = ?"
-            "   AND batch_id = ? ORDER BY generated_at LIMIT ?",
+            "   AND batch_id = ? ORDER BY generated_at, outreach_id LIMIT ?",
             (MODE, batch_id, limit))
 
     def stale_queued(self, batch_id: str) -> list:
@@ -2208,9 +2268,25 @@ TEMPLATE_V9_OWNER = Template(
     ),
 )
 
+# ----------------------------------------------------------------------------
+#  V10_OWNER — ЧИННА ВЕРСІЯ (08.10.2026). V9 слово в слово, змінено лише
+#  номер у підписі: «0 800 357 135» замість «+380 800 357 135». Похідна від
+#  V9, щоб решта тексту гарантовано збігалася; V9 не змінюється.
+# ----------------------------------------------------------------------------
+V9_PHONE, V10_PHONE = "+380 800 357 135", "0 800 357 135"
+assert TEMPLATE_V9_OWNER.body.count(V9_PHONE) == 1
+assert TEMPLATE_V9_OWNER.html.count(V9_PHONE) == 1
+TEMPLATE_V10_OWNER = Template(
+    version="V10_OWNER",
+    subject=TEMPLATE_V9_OWNER.subject,
+    body=TEMPLATE_V9_OWNER.body.replace(V9_PHONE, V10_PHONE),
+    html=TEMPLATE_V9_OWNER.html.replace(V9_PHONE, V10_PHONE),
+)
+
 ALL_TEMPLATES = {t.version: t for t in (TEMPLATE_V4_OWNER, TEMPLATE_V5_REDTEAM,
                                         TEMPLATE_V6_OWNER, TEMPLATE_V7_OWNER,
-                                        TEMPLATE_V8_OWNER, TEMPLATE_V9_OWNER)}
+                                        TEMPLATE_V8_OWNER, TEMPLATE_V9_OWNER,
+                                        TEMPLATE_V10_OWNER)}
 
 
 def active_template() -> Template:
@@ -2457,6 +2533,18 @@ class Verdict:
     reason: str = ""
 
 
+#: Одна адреса без пробілів, ком і крапок підряд. Те, що не проходить,
+#: іде на ручний перегляд: лист «у нікуди» гірший за пропущений.
+_STRICT_EMAIL = re.compile(
+    r"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
+    r"@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}")
+
+
+def valid_email(email: Optional[str]) -> bool:
+    return bool(email) and len(email) <= 254 and bool(
+        _STRICT_EMAIL.fullmatch(email.strip().lower()))
+
+
 def evaluate(repo: Repo, company_id: str, email: Optional[str],
              events: list) -> Verdict:
     stop = repo.suppression(company_id, email)
@@ -2471,6 +2559,8 @@ def evaluate(repo: Repo, company_id: str, email: Optional[str],
 
     if not email:
         return Verdict(False, "REVIEW", "не знайдено e-mail учасника")
+    if not valid_email(email):
+        return Verdict(False, "REVIEW", f"e-mail учасника з помилкою: «{email}»")
 
     with_route = [ev for ev in events if ev.complaint_start or ev.complaint_end]
     if SKIP_WITHOUT_COMPLAINT_ROUTE and not with_route:
@@ -2486,11 +2576,21 @@ def evaluate(repo: Repo, company_id: str, email: Optional[str],
     return Verdict(True, "IN_LETTER")
 
 
-def delivery_address(company_id: str, allowlist: list) -> str:
+def delivery_address(company_id: str, allowlist: list,
+                     contact_email: Optional[str] = None) -> str:
     """
-    Тестова скринька для цієї компанії. Детермінована: повторний прогін
-    надсилає на ту саму адресу, і листи не перемішуються між скриньками.
+    Куди піде лист.
+
+    LIVE — на адресу самої компанії (з Prozorro), і нікуди більше: те саме
+    перевіряє тригер бази. TEST — на тестову скриньку, детерміновано:
+    повторний прогін надсилає на ту саму адресу, і листи не перемішуються.
     """
+    if MODE == "LIVE":
+        if not valid_email(contact_email):
+            raise ERR["LIVE_DELIVERY_NOT_CONTACT"](contact_email or "")
+        return contact_email.strip().lower()
+    if MODE != "TEST":
+        raise ERR["MODE_UNKNOWN"](MODE)
     if not allowlist:
         raise ERR["TEST_ALLOWLIST_EMPTY"]()
     import hashlib                                              # noqa: PLC0415
@@ -2529,7 +2629,8 @@ def build_letter_bytes(row: sqlite3.Row) -> bytes:
         sender_name=SENDER_NAME, sender_email=SENDER_EMAIL,
         to_email=row["delivery_email_actual"], subject=row["subject_rendered"],
         body=row["body_rendered"], message_id=row["message_id_header"],
-        intended_to=row["contact_email_original"],
+        # Заголовок «кому призначався» — лише в тестовому листі.
+        intended_to=(row["contact_email_original"] if row["mode"] == "TEST" else None),
         html_body=row["body_html"] or "")
 
 
@@ -2537,8 +2638,8 @@ def make_transport(dry_run: bool, out_dir: str):
     """Сухий прогін узагалі не має транспорту до Gmail — надіслати нічим."""
     if dry_run:
         return E.DryRunTransport(os.path.join(out_dir, "eml"))
-    if MODE != "TEST":
-        raise ERR["LIVE_NOT_IMPLEMENTED"]()
+    if MODE not in ("TEST", "LIVE"):
+        raise ERR["MODE_UNKNOWN"](MODE)
     # Доступ перевіряємо до створення транспорту: інакше людина побачила б
     # технічну помилку бібліотеки Google замість зрозумілої дії.
     є_доступ, звідки = gmail_secret_ready()
@@ -2716,8 +2817,9 @@ def write_card(row: sqlite3.Row, out_dir: str, letter: Optional[sqlite3.Row] = N
         doc.add_paragraph(f"Тема: {letter['subject_rendered']}")
         doc.add_paragraph(f"Стан: {letter['status']}")
         doc.add_paragraph(f"Кому призначався: {letter['contact_email_original'] or '—'}")
-        doc.add_paragraph(f"Куди фактично пішов (тестовий режим): "
-                          f"{letter['delivery_email_actual']}")
+        doc.add_paragraph(("Куди фактично пішов (тестовий режим): "
+                           if letter["mode"] == "TEST" else "Куди пішов (бойовий лист): ")
+                          + f"{letter['delivery_email_actual']}")
         doc.add_paragraph("Текст листа:")
         for piece in (letter["body_rendered"] or "").split("\n"):
             doc.add_paragraph(piece)
@@ -2754,7 +2856,9 @@ class LeadMail:
     # --- крок 0: підготовка -------------------------------------------------
     def prepare(self, legacy_db: Optional[str] = None) -> dict:
         """Білий список у базу і одноразове перенесення історії движка."""
-        stats = {"тестових_адрес": self.repo.sync_allowlist(TEST_RECIPIENTS)}
+        stats = {"тестових_адрес": (
+            self.repo.sync_allowlist(TEST_RECIPIENTS)
+            if MODE == "TEST" or [a for a in TEST_RECIPIENTS if a.strip()] else 0)}
         row = self.db.one("SELECT value FROM schema_meta WHERE key = 'legacy_imported'")
         if row is None:
             imported = self.repo.import_legacy(legacy_db or LEGACY_DB_PATH)
@@ -2776,6 +2880,7 @@ class LeadMail:
     # --- крок 2: записати ---------------------------------------------------
     def ingest(self, result: ScanResult) -> dict:
         stats = {"нових_подій": 0, "уже_були": 0, "на_перевірку": 0}
+        rearmed_before = self.repo.rearmed
         for facts in result.events:
             company_id = self.repo.company(facts.edrpou, facts.company_name)
             tender_id = self.repo.tender({
@@ -2811,6 +2916,8 @@ class LeadMail:
                       (new_id(), self.run_id, uid, code, detail, now_iso()))
         self.db.x("UPDATE scan_gaps SET resolved = 1 WHERE tender_uid IN"
                   " (SELECT t.tender_id FROM tenders t) AND run_id <> ?", (self.run_id,))
+        if self.repo.rearmed > rearmed_before:
+            stats["повернуто_з_тесту"] = self.repo.rearmed - rearmed_before
         return stats
 
     # --- крок 3: скласти листи ---------------------------------------------
@@ -2866,7 +2973,7 @@ class LeadMail:
                           template_version=active_template().version,
                           subject=letter.subject, body=letter.body,
                           html=letter.html, contact_email=email,
-                          delivery_email=delivery_address(company_id, allow),
+                          delivery_email=delivery_address(company_id, allow, email),
                           message_id=E.build_message_id(idem),
                           event_ids=[r["event_id"] for r in group])
             try:
@@ -2928,8 +3035,10 @@ class LeadMail:
             with open(os.path.join(folder, base + ".eml"), "wb") as fh:
                 fh.write(raw)
             with open(os.path.join(folder, base + ".txt"), "w", encoding="utf-8") as fh:
+                куди = ("Куди піде в тесті" if row["mode"] == "TEST"
+                        else "Куди піде (БОЙОВИЙ лист клієнту)")
                 fh.write(f"Кому призначався: {row['contact_email_original']}\n"
-                         f"Куди піде в тесті: {row['delivery_email_actual']}\n"
+                         f"{куди}: {row['delivery_email_actual']}\n"
                          f"Тема: {row['subject_rendered']}\n\n{row['body_rendered']}")
             # Той самий лист, який побачить клієнт: відкривається у браузері.
             if row["body_html"]:
@@ -2939,12 +3048,14 @@ class LeadMail:
                     fh.write(row["body_html"])
         return {"складено": len(rows), "з_оформленням": html_count, "тека": folder}
 
-    # --- крок 6: відправка на тестові скриньки ------------------------------
+    # --- крок 6: відправка ------------------------------------------------------
     def send(self, transport=None, max_sends: Optional[int] = None,
              paced: bool = True) -> dict:
-        if MODE != "TEST":
-            raise ERR["LIVE_NOT_IMPLEMENTED"]()
-        if not self.db.q("SELECT email FROM test_allowlist LIMIT 1"):
+        """TEST — на тестові скриньки; LIVE — клієнтам. Підтвердження «ТАК»
+        для бойової відправки питає M.send(), а не цей метод."""
+        if MODE not in ("TEST", "LIVE"):
+            raise ERR["MODE_UNKNOWN"](MODE)
+        if MODE == "TEST" and not self.db.q("SELECT email FROM test_allowlist LIMIT 1"):
             raise ERR["TEST_ALLOWLIST_EMPTY"]()
         transport = transport or make_transport(dry_run=False, out_dir=self.out_dir)
         stats = {"SENT_CONFIRMED": 0, "SENT": 0, "SEND_FAILED": 0,
@@ -3144,7 +3255,8 @@ class LeadMail:
             writer.writerow(["ID закупівлі", "ЄДРПОУ", "Компанія", "Час події",
                              "Надійність часу", "Стадія", "Стан ліда", "Причина",
                              "Вартість лота", "Строк оскарження до",
-                             "Стан листа", "Куди пішов у тесті"])
+                             "Стан листа",
+                             "Куди пішов у тесті" if MODE == "TEST" else "Куди пішов"])
             for row in rows:
                 writer.writerow([row["ua_id"], row["edrpou_norm"], row["company_name"],
                                  (row["event_time"] or "").replace("T", " ")[:19],
@@ -3239,7 +3351,8 @@ def gmail_secret_ready(dysk: str = "") -> tuple[bool, str]:
 def _header(title: str) -> None:
     print("=" * 78)
     print(f"  TENDERWIN LEAD & MAIL {VERSION} від {BUILD} · {title}")
-    print(f"  режим {MODE} · шаблон листа {LETTER_VERSION}")
+    print(f"  режим {MODE}" + (" — БОЙОВИЙ: листи клієнтам" if MODE == "LIVE" else "")
+          + f" · шаблон листа {LETTER_VERSION}")
     print("=" * 78)
 
 
@@ -3247,9 +3360,9 @@ def setup(dysk: str = "", legacy_db: str = "") -> dict:
     """Один раз за сеанс: база, білий список, історія попереднього движка."""
     _paths(dysk)
     _header("підготовка")
-    if MODE != "TEST":
-        raise ERR["LIVE_NOT_IMPLEMENTED"]()
-    if not [a for a in TEST_RECIPIENTS if a.strip()]:
+    if MODE not in ("TEST", "LIVE"):
+        raise ERR["MODE_UNKNOWN"](MODE)
+    if MODE == "TEST" and not [a for a in TEST_RECIPIENTS if a.strip()]:
         raise ERR["TEST_ALLOWLIST_EMPTY"]()
     engine = LeadMail()
     try:
@@ -3258,7 +3371,12 @@ def setup(dysk: str = "", legacy_db: str = "") -> dict:
         print(f"  вихід: {OUT_DIR}")
         if SERVICE_CARDS:
             print(f"  справи (картка + протокол): {cases_root()}")
-        print(f"  тестових адрес у білому списку: {stats['тестових_адрес']}")
+        if MODE == "LIVE":
+            print("  БОЙОВИЙ РЕЖИМ: листи складаються на адреси компаній із Prozorro.")
+            print("  Надсилає лише M.send() — і лише після вашого «ТАК».")
+            print("  Тестові листи бойового першого листа не займають.")
+        else:
+            print(f"  тестових адрес у білому списку: {stats['тестових_адрес']}")
         legacy = stats["перенесено_з_движка"]
         if isinstance(legacy, dict):
             if legacy.get("пропущено") == -1:
@@ -3389,11 +3507,59 @@ def _service_cards_step(engine: "LeadMail", *, run_id: Optional[str] = None,
     return stats
 
 
+def _ask(prompt: str) -> str:
+    """Відповідь людини. Без клавіатури (фоновий запуск) — порожньо, тобто «ні»."""
+    try:
+        return input(prompt)
+    except (EOFError, OSError, RuntimeError):
+        return ""
+
+
+def confirm_live(engine: "LeadMail", batch_id: str, max_sends: Optional[int],
+                 answer: Optional[str] = None) -> bool:
+    """
+    Підтвердження бойової відправки. Показує, КОМУ саме зараз підуть листи,
+    і чекає «ТАК». Без нього — нічого не надсилається: «Виконати всі» в
+    Colab не може розіслати листи клієнтам випадково.
+    """
+    limit = max_sends or MAX_SENDS_PER_RUN
+    upcoming = engine.repo.queued(batch_id, limit)
+    total = engine.db.one("SELECT COUNT(*) n FROM outreach WHERE status = 'QUEUED'"
+                          " AND mode = 'LIVE' AND batch_id = ?", (batch_id,))["n"]
+    names = {r["company_id"]: (r["company_name"], r["edrpou_norm"]) for r in engine.db.q(
+        "SELECT company_id, company_name, edrpou_norm FROM companies WHERE company_id IN"
+        " (SELECT company_id FROM outreach WHERE status = 'QUEUED' AND mode = 'LIVE'"
+        "   AND batch_id = ?)", (batch_id,))}
+    хвилин = round(max(0, len(upcoming) - 1)
+                   * (MIN_SEND_DELAY_SECONDS + MAX_SEND_DELAY_SECONDS) / 2 / 60)
+    print("\n  " + "!" * 74)
+    print("  БОЙОВА ВІДПРАВКА: листи підуть КЛІЄНТАМ, на адреси з Prozorro.")
+    print(f"  У черзі партії {batch_id}: {total}. Зараз буде надіслано: {len(upcoming)}"
+          + (f" (решта {total - len(upcoming)} — наступним запуском)"
+             if total > len(upcoming) else "")
+          + (f", ≈ {хвилин} хв із паузами" if хвилин else "") + ".")
+    for номер, row in enumerate(upcoming, 1):
+        назва, код = names.get(row["company_id"], ("", ""))
+        print(f"   {номер:>3}. {назва} ({код}) → {row['delivery_email_actual']}")
+    print("  " + "!" * 74)
+    if answer is None:
+        answer = _ask("  Надіслати ці листи клієнтам? Напишіть ТАК і натисніть Enter: ")
+    ok = str(answer or "").strip().upper() == "ТАК"
+    engine.repo.audit("batch", batch_id, "LIVE_SEND_CONFIRMED" if ok else
+                      "LIVE_SEND_DECLINED", {"листів": len(upcoming)})
+    if not ok:
+        print("  Скасовано: нічого не надіслано. Листи лишаються в черзі.")
+    return ok
+
+
 def send(dysk: str = "", max_sends: Optional[int] = None, paced: bool = True,
-         batch: str = "", force: bool = False) -> dict:
-    """Відправка складених листів на ВАШІ тестові скриньки."""
+         batch: str = "", force: bool = False, confirm: Optional[str] = None) -> dict:
+    """
+    Відправка складених листів. TEST — на ВАШІ тестові скриньки; LIVE —
+    клієнтам, після підтвердження «ТАК» (confirm="ТАК" — без запитання).
+    """
     _paths(dysk)
-    _header("відправка на тестові скриньки")
+    _header("відправка КЛІЄНТАМ" if MODE == "LIVE" else "відправка на тестові скриньки")
     engine = LeadMail()
     try:
         row = engine.db.one(
@@ -3424,10 +3590,21 @@ def send(dysk: str = "", max_sends: Optional[int] = None, paced: bool = True,
                   "надіслати старі, M.send(force=True).")
             return {"надіслано": 0, "причина": "партія іншого дня"}
         engine.batch_id, engine.run_id = row["batch_id"], row["run_id"]
+        if MODE == "LIVE" and not confirm_live(engine, row["batch_id"], max_sends, confirm):
+            return {"надіслано": 0, "причина": "не підтверджено"}
         stats = engine.send(max_sends=max_sends, paced=paced)
         stats["звірка"] = engine.reconcile()
         print(f"\n  Підсумок: {stats}")
-        print(f"  Листи пішли лише на адреси зі списку TEST_RECIPIENTS.")
+        if MODE == "LIVE":
+            лишилось = engine.db.one(
+                "SELECT COUNT(*) n FROM outreach WHERE status = 'QUEUED'"
+                " AND mode = 'LIVE' AND batch_id = ?", (row["batch_id"],))["n"]
+            print("  Бойові листи пішли на адреси компаній. Цим компаніям скрипт "
+                  "першого листа більше не надішле.")
+            if лишилось:
+                print(f"  У черзі цієї партії ще {лишилось} — виконайте M.send() ще раз.")
+        else:
+            print(f"  Листи пішли лише на адреси зі списку TEST_RECIPIENTS.")
         return stats
     finally:
         engine.close()
@@ -3503,11 +3680,14 @@ def _print_report(engine: LeadMail, window: Window, result: ScanResult,
     print(f"     без ЄДРПОУ/ІПН: {counters['без_ЄДРПОУ']}")
     print(f"  Записано подій: нових {out['записано']['нових_подій']}, "
           f"вже були {out['записано']['уже_були']}")
+    if out["записано"].get("повернуто_з_тесту"):
+        print(f"     з них раніше бачив лише тестовий прогін: "
+              f"{out['записано']['повернуто_з_тесту']} — для бойової розсилки вони нові")
     print(f"  Листів складено: {letters['листів']}")
     ПОЯСНЕННЯ = {
         "NOT_ELIGIBLE": "компанія вже отримувала перший лист (або поріг вартості)",
         "SUPPRESSED": "стоп-лист",
-        "REVIEW": "немає e-mail або ненадійні дані — на ваш перегляд",
+        "REVIEW": "немає e-mail, e-mail із помилкою або ненадійні дані — на ваш перегляд",
         "NO_COMPLAINT_ROUTE": "у даних немає періоду оскарження",
     }
     for key in ("NOT_ELIGIBLE", "SUPPRESSED", "REVIEW", "NO_COMPLAINT_ROUTE"):
@@ -3536,7 +3716,12 @@ def _print_report(engine: LeadMail, window: Window, result: ScanResult,
     else:
         print("  ⓘ Службові картки вимкнено (SERVICE_CARDS = False): документи "
               "рішень не завантажувались.")
-    print(f"\n  Далі: прочитайте кілька листів у теці eml, потім M.send().")
+    if MODE == "LIVE":
+        print("\n  БОЙОВИЙ РЕЖИМ: листи складено на адреси КЛІЄНТІВ (поки лише у файли).")
+        print("  Далі: прочитайте кілька листів у теці eml, потім M.send() — він покаже,")
+        print("  кому саме підуть листи, і попросить «ТАК».")
+    else:
+        print(f"\n  Далі: прочитайте кілька листів у теці eml, потім M.send().")
 
 
 def tests(folder: str = "") -> None:
