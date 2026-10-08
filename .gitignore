@@ -1,0 +1,17 @@
+# Секрети — ніколи
+.gmail_token.json
+*.token.json
+client_secret*.json
+
+# Бази й робочі результати
+*.db
+*.db-shm
+*.db-wal
+vyhid_lystiv/
+Службові картки/
+Протоколи відхилень/
+0 Cases/
+
+# Python
+__pycache__/
+*.pyc
