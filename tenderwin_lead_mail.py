@@ -281,6 +281,12 @@ SHOW_OPT_OUT_LINE = False
 MIN_SEND_DELAY_SECONDS = 120
 MAX_SEND_DELAY_SECONDS = 180
 MAX_SENDS_PER_RUN = 25
+#: Скільки разів пробувати лист, який Gmail відхилив (ліміт, збій токена).
+#: Невдалий лист повертається в чергу; після цієї кількості — SEND_FAILED.
+MAX_SEND_ATTEMPTS = 3
+#: Стільки відмов Gmail підряд — і відправка зупиняється: це вже не один
+#: поганий лист, а проблема з поштою, і решту черги краще не палити.
+STOP_AFTER_FAILURES_IN_ROW = 2
 
 # --- Службові картки (з 1.3.0; рішення власника 04.10.2026) ----------------
 #: Після листів M.go() завантажує документи самого рішення замовника
@@ -860,6 +866,7 @@ class Repo:
     def __init__(self, db: Db):
         self.db = db
         self.rearmed = 0          # подій, повернутих із тестових прогонів
+        self.seen: set = set()    # події, які бачив поточний прогін
 
     # --- журнал -------------------------------------------------------------
     def audit(self, entity: str, entity_id: str, event: str, payload: dict | None = None):
@@ -935,7 +942,7 @@ class Repo:
 
     # --- події --------------------------------------------------------------
     def event(self, facts: "Rejection", tender_id: str, company_id: str,
-              run_id: str) -> tuple[str, bool]:
+              run_id: str, rearm: bool = True) -> tuple[str, bool]:
         row = self.db.one(
             "SELECT e.event_id, e.run_id, r.mode AS run_mode FROM events e"
             "  LEFT JOIN runs r ON r.run_id = e.run_id"
@@ -945,10 +952,11 @@ class Repo:
             (tender_id, facts.stage, facts.object_id, facts.bid_id or "",
              facts.lot_id or ""))
         if row:
+            self.seen.add(row["event_id"])
             self.db.x("UPDATE events SET object_status = ?, status_checked_at = ?"
                       " WHERE event_id = ?",
                       (facts.object_status, now_iso(), row["event_id"]))
-            if MODE == "LIVE" and (row["run_mode"] or "TEST") != "LIVE" \
+            if rearm and MODE == "LIVE" and (row["run_mode"] or "TEST") != "LIVE" \
                     and row["run_id"] != run_id:
                 # Подію раніше бачив лише тестовий прогін: тестові рішення
                 # («вже писали», «у листі») для бойової розсилки не діють.
@@ -983,6 +991,7 @@ class Repo:
              json.dumps(facts.docs_td, ensure_ascii=False),
              1 if facts.joint_bid else 0, facts.identity_note, now_iso(),
              "NEW", None))
+        self.seen.add(eid)
         self.audit("event", eid, "EVENT_DISCOVERED",
                    {"ua_id": facts.ua_id, "edrpou": facts.edrpou,
                     "time": facts.event_time.isoformat(),
@@ -1067,6 +1076,22 @@ class Repo:
         self.db.x(f"UPDATE outreach SET {', '.join(cols)} WHERE outreach_id = ?",
                   tuple(args))
         self.audit("outreach", outreach_id, f"STATUS_{status}", fields)
+
+    def claim(self, outreach_id: str) -> bool:
+        """Взяти лист у відправку одним кроком. Інша відправка, що вже взяла
+        його (другий запуск, друге вікно Colab), отримає False і пропустить."""
+        cur = self.db.x("UPDATE outreach SET status = 'SENDING'"
+                        " WHERE outreach_id = ? AND status = 'QUEUED'", (outreach_id,))
+        if cur.rowcount != 1:
+            return False
+        self.audit("outreach", outreach_id, "STATUS_SENDING", {})
+        return True
+
+    def send_retries(self, outreach_id: str) -> int:
+        """Скільки разів лист уже повертали в чергу після відмови Gmail."""
+        return self.db.one("SELECT COUNT(*) n FROM audit_log WHERE entity = 'outreach'"
+                           " AND entity_id = ? AND event = 'SEND_RETRY'",
+                           (outreach_id,))["n"]
 
     def queued(self, batch_id: str, limit: int) -> list:
         return self.db.q(
@@ -2574,6 +2599,13 @@ def evaluate(repo: Repo, company_id: str, email: Optional[str],
     return Verdict(True, "IN_LETTER")
 
 
+def _mode_checked() -> str:
+    """MODE для підстановки в SQL — лише одне з двох відомих значень."""
+    if MODE not in ("TEST", "LIVE"):
+        raise ERR["MODE_UNKNOWN"](MODE)
+    return MODE
+
+
 def delivery_address(company_id: str, allowlist: list,
                      contact_email: Optional[str] = None) -> str:
     """
@@ -2613,6 +2645,28 @@ class Draft:
     delivery_email: str
     message_id: str
     event_ids: list
+
+
+#: Відмови, які ДОВОДЯТЬ, що Gmail листа не прийняв: запит відхилено (4xx),
+#: токен недійсний. Лише такий лист можна сміливо повторити.
+_DEFINITE_REFUSAL = re.compile(
+    r"invalid_grant|RefreshError|unauthorized|forbidden|rate.?limit|quota|"
+    r"too many requests|invalid to header|bad request", re.IGNORECASE)
+
+
+def gmail_refused(error: str) -> bool:
+    """
+    True — Gmail точно НЕ надіслав лист (можна повторити).
+    False — стан невідомий: 5xx, обірвана відповідь, будь-що інше. Лист міг
+    піти, тож повтор наосліп дав би клієнту другий «перший» лист.
+    """
+    text = str(error or "")
+    code = re.search(r"HttpError (\d{3})", text)
+    if code:
+        return code.group(1).startswith("4")
+    if re.match(r"\s*4\d\d\b", text):
+        return True
+    return bool(_DEFINITE_REFUSAL.search(text))
 
 
 def build_letter_bytes(row: sqlite3.Row) -> bytes:
@@ -2707,7 +2761,10 @@ def write_card(row: sqlite3.Row, out_dir: str, letter: Optional[sqlite3.Row] = N
     # компанію можуть відхилити двічі (два лоти, два рішення), і без нього
     # друга картка мовчки не створилася б — це втрата доказу.
     name = (f"{row['ua_id']}__{row['edrpou_norm']}__"
-            f"{str(row['object_id'] or 'bez-id')[:8]}.docx")
+            f"{str(row['object_id'] or 'bez-id')[:8]}"
+            # Бойова картка — окремий файл: тестова картка тієї самої події
+            # (сьогоднішній тестовий прогін) не має її підміняти.
+            f"{'__LIVE' if MODE == 'LIVE' else ''}.docx")
     path = os.path.join(folder, re.sub(r"[^\w.\-]", "_", name))
     if os.path.exists(path):
         return path, False               # ваші нотатки не перезаписуються
@@ -2850,6 +2907,7 @@ class LeadMail:
         stamp = now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
         self.run_id = f"R{stamp}"
         self.batch_id = f"B{stamp}"
+        self.event_contact: dict = {}       # подія → контакт із її пропозиції
 
     # --- крок 0: підготовка -------------------------------------------------
     def prepare(self, legacy_db: Optional[str] = None) -> dict:
@@ -2890,9 +2948,13 @@ class LeadMail:
                 "tender_value": facts.tender_value})
             greeting, confidence, source = greeting_for(facts.person.name_raw,
                                                         facts.company_name)
-            self.repo.contact(company_id, facts.person.email, facts.person.name_raw,
-                              facts.person.phone, greeting, confidence, source)
-            _, is_new = self.repo.event(facts, tender_id, company_id, self.run_id)
+            contact_id = self.repo.contact(company_id, facts.person.email,
+                                           facts.person.name_raw, facts.person.phone,
+                                           greeting, confidence, source)
+            event_id, is_new = self.repo.event(facts, tender_id, company_id, self.run_id)
+            # Лист іде на адресу з тієї самої пропозиції, про яку він,
+            # а не на найстарішу адресу компанії з минулих закупівель.
+            self.event_contact[event_id] = contact_id
             stats["нових_подій" if is_new else "уже_були"] += 1
         for facts, why in result.review:
             stats["на_перевірку"] += 1
@@ -2906,7 +2968,8 @@ class LeadMail:
                 "method_type": facts.method_type,
                 "tender_status": facts.tender_status,
                 "tender_value": facts.tender_value})
-            event_id, _ = self.repo.event(facts, tender_id, company_id, self.run_id)
+            event_id, _ = self.repo.event(facts, tender_id, company_id, self.run_id,
+                                          rearm=False)
             self.repo.set_event_state(event_id, "REVIEW", why)
         for uid, code, detail in result.gaps:
             self.db.x("INSERT INTO scan_gaps(gap_id, run_id, tender_uid, error_code,"
@@ -2944,10 +3007,7 @@ class LeadMail:
             "SELECT email FROM test_allowlist ORDER BY email")]
         for company_id, group in by_company.items():
             events = [self._facts_from_row(r) for r in group]
-            contact = self.db.one(
-                "SELECT contact_id, contact_email, contact_name_raw, contact_vocative"
-                "  FROM contacts WHERE company_id = ?"
-                " ORDER BY (contact_email IS NULL), created_at LIMIT 1", (company_id,))
+            contact = self.letter_contact(company_id, group)
             email = contact["contact_email"] if contact else None
             verdict = evaluate(self.repo, company_id, email, events)
             if not verdict.allowed:
@@ -2987,6 +3047,30 @@ class LeadMail:
                 self.repo.set_event_state(row["event_id"], "IN_LETTER", "")
         return stats
 
+    def letter_contact(self, company_id: str, group: list):
+        """
+        Кому писати. Спершу — контакт із пропозицій, про які цей лист
+        (головна закупівля першою), з коректною адресою. Якщо там адреси
+        немає — найсвіжіший коректний контакт компанії. Якщо коректних
+        немає зовсім — будь-який, щоб у причині ручного перегляду було видно,
+        яка саме адреса з помилкою.
+        """
+        cols = "contact_id, contact_email, contact_name_raw, contact_vocative"
+        own = [self.db.one(f"SELECT {cols} FROM contacts WHERE contact_id = ?", (kid,))
+               for kid in (self.event_contact.get(r["event_id"]) for r in group) if kid]
+        own = [c for c in own if c is not None]
+        for candidate in own:
+            if valid_email(candidate["contact_email"]):
+                return candidate
+        others = self.db.q(f"SELECT {cols} FROM contacts WHERE company_id = ?"
+                           " AND contact_email IS NOT NULL ORDER BY created_at DESC",
+                           (company_id,))
+        for candidate in others:
+            if valid_email(candidate["contact_email"]):
+                return candidate
+        with_email = [c for c in own + list(others) if c["contact_email"]]
+        return with_email[0] if with_email else (own[0] if own else None)
+
     def _facts_from_row(self, row: sqlite3.Row) -> Rejection:
         """Рядок бази -> факти для шаблона. Без повторного походу в мережу."""
         return Rejection(
@@ -3016,6 +3100,20 @@ class LeadMail:
             self.repo.set_outreach(row["outreach_id"], "CANCELLED",
                                    error_code="STALE_BATCH",
                                    error_detail="лист іншої партії, не надсилається")
+            # Подія, яку цей прогін бачив знову (вона в сьогоднішньому вікні),
+            # отримує лист у новій партії. Інакше повторний запуск клітинки 6
+            # мовчки забирав би лист у компаній, яким його так і не надіслали.
+            try:
+                event_ids = json.loads(row["event_ids"] or "[]")
+            except ValueError:
+                event_ids = []
+            for event_id in event_ids:
+                if event_id in self.repo.seen:
+                    self.db.x("UPDATE events SET run_id = ?, state = 'NEW',"
+                              " state_reason = NULL WHERE event_id = ?"
+                              "   AND state = 'IN_LETTER'", (self.run_id, event_id))
+                    self.repo.audit("event", event_id, "EVENT_REARMED_AFTER_CANCEL",
+                                    {"cancelled": row["outreach_id"], "run": self.run_id})
         return len(stale)
 
     # --- крок 5: сухий прогін ----------------------------------------------
@@ -3057,28 +3155,69 @@ class LeadMail:
         transport = transport or make_transport(dry_run=False, out_dir=self.out_dir)
         stats = {"SENT_CONFIRMED": 0, "SENT": 0, "SEND_FAILED": 0,
                  "DELIVERY_UNKNOWN": 0}
+        stats["ПОВЕРНУТО_В_ЧЕРГУ"] = 0
         rows = self.repo.queued(self.batch_id, max_sends or MAX_SENDS_PER_RUN)
+        failures_in_row = 0
         for index, row in enumerate(rows):
+            if failures_in_row >= STOP_AFTER_FAILURES_IN_ROW:
+                stats["ЗУПИНЕНО"] = (f"Gmail відмовив {failures_in_row} рази поспіль — "
+                                     f"відправку зупинено, решта листів у черзі")
+                if self.verbose:
+                    print(f"    ! {stats['ЗУПИНЕНО']}", flush=True)
+                break
             if index and paced:
                 pause = random.uniform(MIN_SEND_DELAY_SECONDS, MAX_SEND_DELAY_SECONDS)
                 if self.verbose:
                     print(f"    пауза {pause:.0f} с …", flush=True)
                 time.sleep(pause)
-            self.repo.set_outreach(row["outreach_id"], "SENDING")
+            if not self.repo.claim(row["outreach_id"]):
+                continue                  # лист уже взяла інша відправка
+            if self.repo.send_retries(row["outreach_id"]):
+                # Повтор після відмови: спершу переконатися, що листа ще
+                # немає в «Надісланих» — інакше клієнт отримав би його двічі.
+                try:
+                    found = transport.find_by_message_id(row["message_id_header"])
+                except Exception:                                # noqa: BLE001
+                    found = None
+                if found:
+                    self.repo.set_outreach(row["outreach_id"], "SENT_CONFIRMED",
+                                           provider_message_id=found.get("id"),
+                                           provider_thread_id=found.get("threadId"),
+                                           sent_at=now_iso(), error_code=None,
+                                           error_detail=None)
+                    stats["SENT_CONFIRMED"] += 1
+                    continue
             raw = build_letter_bytes(row)
             result = transport.send(raw, row["message_id_header"])
-            if not result.ok and getattr(result, "unknown", False):
+            if not result.ok and (getattr(result, "unknown", False)
+                                  or not gmail_refused(result.error or "")):
+                # Лист міг піти: стан «невідомо», звірка шукає його в Gmail.
+                failures_in_row += 1
                 self.repo.set_outreach(row["outreach_id"], "DELIVERY_UNKNOWN",
                                        error_code="UNKNOWN",
                                        error_detail=(result.error or "")[:200])
                 stats["DELIVERY_UNKNOWN"] += 1
                 continue
             if not result.ok:
-                self.repo.set_outreach(row["outreach_id"], "SEND_FAILED",
-                                       error_code="SEND_FAILED",
-                                       error_detail=(result.error or "")[:200])
-                stats["SEND_FAILED"] += 1
+                failures_in_row += 1
+                error = (result.error or "")[:200]
+                if self.repo.send_retries(row["outreach_id"]) + 1 < MAX_SEND_ATTEMPTS:
+                    # Лист не пішов — компанія лишається в черзі: наступний
+                    # запуск відправки спробує ще раз.
+                    self.repo.set_outreach(row["outreach_id"], "QUEUED",
+                                           error_code="SEND_RETRY", error_detail=error)
+                    self.repo.audit("outreach", row["outreach_id"], "SEND_RETRY",
+                                    {"error": error})
+                    stats["ПОВЕРНУТО_В_ЧЕРГУ"] += 1
+                else:
+                    self.repo.set_outreach(row["outreach_id"], "SEND_FAILED",
+                                           error_code="SEND_FAILED", error_detail=error)
+                    stats["SEND_FAILED"] += 1
+                if self.verbose:
+                    print(f"    [{index + 1}/{len(rows)}] Gmail відмовив → "
+                          f"{row['delivery_email_actual']}: {error}", flush=True)
                 continue
+            failures_in_row = 0
             confirmed, why = verify_sent(transport, result.message_id)
             self.repo.set_outreach(
                 row["outreach_id"], "SENT_CONFIRMED" if confirmed else "SENT",
@@ -3134,11 +3273,11 @@ class LeadMail:
             "       t.buyer_name, t.buyer_edrpou, t.cpv, t.method_type,"
             "       t.tender_status,"
             "       (SELECT contact_email FROM contacts k WHERE k.company_id = e.company_id"
-            "          ORDER BY (contact_email IS NULL), created_at LIMIT 1) contact_email,"
+            "          ORDER BY (contact_email IS NULL), created_at DESC LIMIT 1) contact_email,"
             "       (SELECT contact_name_raw FROM contacts k WHERE k.company_id = e.company_id"
-            "          ORDER BY (contact_email IS NULL), created_at LIMIT 1) contact_name_raw,"
+            "          ORDER BY (contact_email IS NULL), created_at DESC LIMIT 1) contact_name_raw,"
             "       (SELECT contact_phone FROM contacts k WHERE k.company_id = e.company_id"
-            "          ORDER BY (contact_email IS NULL), created_at LIMIT 1) contact_phone"
+            "          ORDER BY (contact_email IS NULL), created_at DESC LIMIT 1) contact_phone"
             "  FROM events e"
             "  JOIN companies c ON c.company_id = e.company_id"
             "  JOIN tenders   t ON t.tender_id = e.tender_id"
@@ -3173,17 +3312,20 @@ class LeadMail:
             "       t.buyer_name, t.buyer_edrpou, t.cpv, t.method_type,"
             "       t.tender_status,"
             "       (SELECT contact_email FROM contacts k WHERE k.company_id = e.company_id"
-            "          ORDER BY (contact_email IS NULL), created_at LIMIT 1) contact_email,"
+            "          ORDER BY (contact_email IS NULL), created_at DESC LIMIT 1) contact_email,"
             "       (SELECT contact_name_raw FROM contacts k WHERE k.company_id = e.company_id"
-            "          ORDER BY (contact_email IS NULL), created_at LIMIT 1) contact_name_raw,"
+            "          ORDER BY (contact_email IS NULL), created_at DESC LIMIT 1) contact_name_raw,"
             "       (SELECT contact_phone FROM contacts k WHERE k.company_id = e.company_id"
-            "          ORDER BY (contact_email IS NULL), created_at LIMIT 1) contact_phone,"
+            "          ORDER BY (contact_email IS NULL), created_at DESC LIMIT 1) contact_phone,"
             "       (SELECT o.status FROM outreach o"
             "         WHERE o.event_ids LIKE '%' || e.event_id || '%'"
+            f"          AND o.mode = '{_mode_checked()}'"
             "         ORDER BY o.generated_at DESC LIMIT 1) letter_status,"
             "       (SELECT o.template_version FROM outreach o"
             "         WHERE o.event_ids LIKE '%' || e.event_id || '%'"
-            "         ORDER BY o.generated_at DESC LIMIT 1) letter_template"
+            f"          AND o.mode = '{_mode_checked()}'"
+            "         ORDER BY o.generated_at DESC LIMIT 1) letter_template,"
+            f"       '{_mode_checked()}' AS letter_mode"
             "  FROM events e"
             "  JOIN companies c ON c.company_id = e.company_id"
             "  JOIN tenders   t ON t.tender_id = e.tender_id")
@@ -3546,16 +3688,32 @@ def send(dysk: str = "", max_sends: Optional[int] = None, paced: bool = True,
         stats = engine.send(max_sends=max_sends, paced=paced)
         stats["звірка"] = engine.reconcile()
         print(f"\n  Підсумок: {stats}")
-        if MODE == "LIVE":
-            лишилось = engine.db.one(
-                "SELECT COUNT(*) n FROM outreach WHERE status = 'QUEUED'"
-                " AND mode = 'LIVE' AND batch_id = ?", (row["batch_id"],))["n"]
-            print("  Бойові листи пішли на адреси компаній. Цим компаніям скрипт "
-                  "першого листа більше не надішле.")
-            if лишилось:
-                print(f"  У черзі цієї партії ще {лишилось} — виконайте M.send() ще раз.")
+        надіслано = (stats.get("SENT_CONFIRMED", 0) + stats.get("SENT", 0)
+                     + stats["звірка"].get("знайдено", 0))
+        невідомо = stats["звірка"].get("на_ручний_перегляд", 0) + stats["звірка"].get(
+            "звірка_не_вдалась", 0)
+        лишилось = engine.db.one(
+            "SELECT COUNT(*) n FROM outreach WHERE status = 'QUEUED'"
+            " AND mode = ? AND batch_id = ?", (MODE, row["batch_id"]))["n"]
+        if невідомо:
+            print(f"  Стан невідомий: {невідомо} лист(и) — могли піти. Скрипт їх НЕ "
+                  f"повторює; перевірте «Надіслані» в Gmail.")
+        if not надіслано and not невідомо:
+            print("  Нічого не надіслано.")
+        elif MODE == "LIVE":
+            print(f"  Бойових листів надіслано: {надіслано} — на адреси компаній. "
+                  f"Цим компаніям скрипт першого листа більше не надішле.")
         else:
             print(f"  Листи пішли лише на адреси зі списку TEST_RECIPIENTS.")
+        if stats.get("ПОВЕРНУТО_В_ЧЕРГУ"):
+            print(f"  Gmail відмовив {stats['ПОВЕРНУТО_В_ЧЕРГУ']} лист(ам) — вони "
+                  f"лишились у черзі, наступний запуск спробує ще раз "
+                  f"(до {MAX_SEND_ATTEMPTS} спроб).")
+        if stats.get("SEND_FAILED"):
+            print(f"  Не надіслано остаточно після {MAX_SEND_ATTEMPTS} спроб: "
+                  f"{stats['SEND_FAILED']}.")
+        if лишилось:
+            print(f"  У черзі цієї партії ще {лишилось} — виконайте M.send() ще раз.")
         return stats
     finally:
         engine.close()
@@ -3570,8 +3728,12 @@ def state(dysk: str = "") -> dict:
         out = {
             "події": {r["state"]: r["n"] for r in engine.db.q(
                 "SELECT state, COUNT(*) n FROM events GROUP BY state ORDER BY n DESC")},
-            "листи": {r["status"]: r["n"] for r in engine.db.q(
-                "SELECT status, COUNT(*) n FROM outreach GROUP BY status ORDER BY n DESC")},
+            "бойові листи (LIVE)": {r["status"]: r["n"] for r in engine.db.q(
+                "SELECT status, COUNT(*) n FROM outreach WHERE mode = 'LIVE'"
+                " GROUP BY status ORDER BY n DESC")},
+            "тестові листи (TEST)": {r["status"]: r["n"] for r in engine.db.q(
+                "SELECT status, COUNT(*) n FROM outreach WHERE mode = 'TEST'"
+                " GROUP BY status ORDER BY n DESC")},
             "компаній": engine.db.one("SELECT COUNT(*) n FROM companies")["n"],
             "стоп-лист": engine.db.one("SELECT COUNT(*) n FROM suppressions")["n"],
             "незакриті прогалини сканування": engine.db.one(

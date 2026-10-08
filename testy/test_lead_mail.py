@@ -1327,13 +1327,19 @@ class TestSending(Base):
         self.assertEqual(row["error_code"], "NOT_VERIFIED")
 
     def test_failure_keeps_the_lead_for_a_retry(self):
+        """Відмова Gmail: лист лишається в черзі; після MAX_SEND_ATTEMPTS — SEND_FAILED."""
         eng = self.prepared()
-        stats = eng.send(transport=FakeTransport(FakeResult(ok=False, error="400")),
-                         paced=False)
-        row = eng.db.one("SELECT status FROM outreach")
+
+        class Відмова(FakeTransport):
+            def find_by_message_id(self, message_id_header):
+                return None              # відхилений лист у «Надісланих» не лежить
+        відмова = Відмова(FakeResult(ok=False, error="400"))
+        стани = []
+        for _ in range(M.MAX_SEND_ATTEMPTS):
+            eng.send(transport=відмова, paced=False)
+            стани.append(eng.db.one("SELECT status FROM outreach")["status"])
         eng.close()
-        self.assertEqual(stats["SEND_FAILED"], 1)
-        self.assertEqual(row["status"], "SEND_FAILED")
+        self.assertEqual(стани, ["QUEUED"] * (M.MAX_SEND_ATTEMPTS - 1) + ["SEND_FAILED"])
 
     def test_unknown_result_never_resends_blindly(self):
         eng = self.prepared()

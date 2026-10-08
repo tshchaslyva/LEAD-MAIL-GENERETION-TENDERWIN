@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
- TENDERWIN SERVICE CARDS v1.1.0 · СЛУЖБОВІ КАРТКИ ВІДХИЛЕНЬ І ПРОТОКОЛИ
+ TENDERWIN SERVICE CARDS v1.1.1 · СЛУЖБОВІ КАРТКИ ВІДХИЛЕНЬ І ПРОТОКОЛИ
 =============================================================================
 
  ЩО ЦЕ
@@ -76,8 +76,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
-VERSION = "1.1.0"
-BUILD = "2026-10-06"
+VERSION = "1.1.1"
+BUILD = "2026-10-08"
 MANIFEST_SCHEMA = "tenderwin.service_card/1"
 KYIV = ZoneInfo("Europe/Kyiv")
 
@@ -1462,7 +1462,8 @@ def render_card_docx(ctx: dict) -> bytes:
          f"{ev['complaint_start_h'] or '—'} — {ev['complaint_end_h'] or '—'}"),
         ("Скарги і вимоги до рішення", ctx["complaints_h"]),
         ("Вимога на 24 години", ctx["milestones_h"]),
-        ("Лист (тестовий режим)", ev["letter_h"]),
+        ({"LIVE": "Лист (бойовий)", "TEST": "Лист (тестовий режим)"}.get(
+            ev.get("letter_mode") or "", "Лист"), ev["letter_h"]),
     ])
     para("Строк оскарження — це поле системи Prozorro, а не юридичний висновок.",
          italic=True)
@@ -1724,6 +1725,7 @@ def _event_view(row: dict, now_moment: datetime) -> dict:
         "lead_state_h": f"{state} — {LEAD_STATE_UA.get(state, '')}".strip(" —"),
         "state_reason": row.get("state_reason") or "",
         "letter_h": letter_h,
+        "letter_mode": row.get("letter_mode") or "",
         "reason_raw": row.get("reason_raw") or "",
     }
 

@@ -307,6 +307,256 @@ class TestLiveSend(LiveBase):
         self.assertIn("БОЙОВИЙ РЕЖИМ", buf.getvalue())
 
 
+class TestReviewFixes(LiveBase):
+    """Виправлення за незалежною перевіркою 08.10.2026."""
+
+    def test_letter_goes_to_the_address_of_todays_bid(self):
+        """Стара адреса компанії з минулого (тестового) прогону — не адресат."""
+        M.MODE = "TEST"
+        self.build([t_one(email="old.agent@agency.example")])
+        M.MODE = "LIVE"
+        self.build([t_one(uid="t2", ua="UA-2026-09-02-000002-a", hour=15,
+                          email="director@bud.example")])
+        live = [r for r in self.letters() if r["mode"] == "LIVE"]
+        self.assertEqual([r["delivery_email_actual"] for r in live],
+                         ["director@bud.example"])
+
+    def test_address_of_the_rejected_bid_beats_a_newer_company_address(self):
+        """Компанія мала дві адреси; лист — на ту, що в пропозиції, про яку він."""
+        M.MODE = "TEST"
+        self.build([t_one(email="tender@bud.example")])           # закупівля A
+        self.build([t_one(uid="t2", ua="UA-2026-09-02-000002-a", hour=15,
+                          email="newer@bud.example")])            # закупівля B
+        M.MODE = "LIVE"
+        self.build([t_one(email="tender@bud.example")])           # бойовий: лише A
+        live = [r for r in self.letters() if r["mode"] == "LIVE"]
+        self.assertEqual([r["delivery_email_actual"] for r in live],
+                         ["tender@bud.example"])
+
+    def test_bad_address_today_falls_back_to_a_good_one(self):
+        self.build([t_one(email="good@bud.example")])
+        self.mark("CANCELLED")
+        self.build([t_one(uid="t2", ua="UA-2026-09-02-000002-a", hour=15,
+                          email="bad..address@bud.example")])
+        live = [r for r in self.letters() if r["status"] == "QUEUED"]
+        self.assertEqual([r["delivery_email_actual"] for r in live], ["good@bud.example"])
+
+    def test_second_dry_run_the_same_day_rebuilds_unsent_letters(self):
+        """Клітинка 6 удруге: ненадіслані листи першої партії складаються заново."""
+        self.build([t_one(), t_one(uid="t2", ua="UA-2026-09-02-000002-a", hour=15,
+                                   code="87654321", name="ТОВ «ІНША»",
+                                   email="info@insha.example")])
+        self.mark("SENT_CONFIRMED")                      # один лист уже пішов
+        eng, _ = self.run_scan([t_one(), t_one(uid="t2", ua="UA-2026-09-02-000002-a",
+                                               hour=15, code="87654321",
+                                               name="ТОВ «ІНША»",
+                                               email="info@insha.example")])
+        скасовано = eng.cancel_stale()
+        built = eng.build_letters()
+        eng.close()
+        self.assertEqual(скасовано, 1)
+        self.assertEqual(built["листів"], 1)
+        statuses = sorted(r["status"] for r in self.letters())
+        self.assertEqual(statuses, ["CANCELLED", "QUEUED", "SENT_CONFIRMED"])
+        sent = [r["company_id"] for r in self.letters() if r["status"] == "SENT_CONFIRMED"]
+        queued = [r["company_id"] for r in self.letters() if r["status"] == "QUEUED"]
+        self.assertNotEqual(sent, queued)                 # дубля немає
+
+    def test_cancelled_letter_of_another_day_is_not_rebuilt(self):
+        self.build([t_one()])
+        eng = self.engine()                               # прогін без цієї події
+        скасовано = eng.cancel_stale()
+        built = eng.build_letters()
+        eng.close()
+        self.assertEqual((скасовано, built["листів"]), (1, 0))
+
+    def test_review_events_are_not_rearmed(self):
+        eng = self.engine()
+        facts_events_before = eng.repo.rearmed
+        eng.close()
+        M.MODE = "TEST"
+        self.build([t_one()])
+        M.MODE = "LIVE"
+        eng = self.engine()
+        win = M.Window(*M.day_bounds(T.TODAY), mode="TODAY_ONLY")
+        win = M.Window(win.start, min(win.end, T.TODAY), win.mode, win.tail_start)
+        result = T.FakeApi([t_one()]).scan(win)
+        result.review = [(f, "на перевірку") for f in result.events]
+        result.events = []
+        eng.repo.start_run(eng.run_id, win)
+        stats = eng.ingest(result)
+        eng.close()
+        self.assertEqual(facts_events_before, 0)
+        self.assertNotIn("повернуто_з_тесту", stats)
+
+    def test_live_working_card_is_a_separate_file(self):
+        M.MODE = "TEST"
+        eng, _ = self.run_scan([t_one()])
+        eng.build_letters(); test_cards = eng.cards(); eng.close()
+        M.MODE = "LIVE"
+        eng, _ = self.run_scan([t_one()])
+        eng.build_letters(); live_cards = eng.cards(); folder = live_cards["тека"]
+        eng.close()
+        self.assertEqual((test_cards["карток"], live_cards["карток"]), (1, 1))
+        files = sorted(f for _, _, fs in os.walk(folder) for f in fs)
+        self.assertEqual(len(files), 2)
+        self.assertTrue(any(f.endswith("__LIVE.docx") for f in files))
+
+    def test_state_counts_live_and_test_separately(self):
+        M.MODE = "TEST"
+        self.build([t_one()])
+        M.MODE = "LIVE"
+        self.build([t_one(uid="t2", ua="UA-2026-09-02-000002-a", hour=15)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = M.state()
+        self.assertEqual(out["бойові листи (LIVE)"], {"QUEUED": 1})
+        self.assertEqual(out["тестові листи (TEST)"], {"QUEUED": 1})
+
+
+class TestSendFailures(LiveBase):
+    def setUp(self):
+        super().setUp()
+        self.build([t_one(), t_one(uid="t2", ua="UA-2026-09-02-000002-a", hour=15,
+                                   code="87654321", name="ТОВ «ІНША»",
+                                   email="info@insha.example"),
+                    t_one(uid="t3", ua="UA-2026-09-03-000003-a", hour=16,
+                          code="11223344", name="ТОВ «ТРЕТЯ»", email="info@tretia.example")])
+
+    def eng_send(self, transport):
+        eng = self.engine()
+        eng.batch_id = eng.db.one("SELECT batch_id FROM outreach LIMIT 1")["batch_id"]
+        eng.verbose = False
+        stats = eng.send(transport=transport, paced=False)
+        eng.close()
+        return stats
+
+    def test_gmail_refusal_stops_the_batch_and_keeps_letters_queued(self):
+        """Прострочений токен / ліміт: зупинка після 2 відмов, ніхто не втрачений."""
+        refusal = T.FakeTransport(T.FakeResult(ok=False, error="invalid_grant"))
+        stats = self.eng_send(refusal)
+        self.assertEqual(len(refusal.sent), M.STOP_AFTER_FAILURES_IN_ROW)
+        self.assertIn("ЗУПИНЕНО", stats)
+        self.assertEqual(sorted(r["status"] for r in self.letters()), ["QUEUED"] * 3)
+        ok = T.FakeTransport()
+        self.eng_send(ok)                                  # пошта ожила — усі пішли
+        self.assertEqual(len(ok.sent), 3)
+        self.assertEqual(sorted(r["status"] for r in self.letters()),
+                         ["SENT_CONFIRMED"] * 3)
+
+    def test_letter_taken_by_another_send_is_skipped(self):
+        """Друга відправка забирає лист уже ПІСЛЯ того, як перша прочитала чергу."""
+        test = self
+        batch = self.letters()[0]["batch_id"]
+        rows = self.engine().repo.queued(batch, 10)
+        other = self.engine()
+
+        class Racing(T.FakeTransport):
+            def send(self, raw, message_id_header):
+                if not self.sent:                          # під час першого листа
+                    test.assertTrue(other.repo.claim(rows[1]["outreach_id"]))
+                return super().send(raw, message_id_header)
+        fake = Racing()
+        self.eng_send(fake)
+        other.close()
+        sent_ids = [m for m, _ in fake.sent]
+        self.assertNotIn(rows[1]["message_id_header"], sent_ids)
+        self.assertEqual(len(fake.sent), 2)                # взятий лист не дублюється
+
+    def test_summary_does_not_claim_letters_went_when_none_did(self):
+        refusal = T.FakeTransport(T.FakeResult(ok=False, error="403 quota"))
+        real = M.make_transport
+        M.make_transport = lambda dry_run, out_dir: refusal
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                M.send(paced=False)
+        finally:
+            M.make_transport = real
+        text = buf.getvalue()
+        self.assertIn("Нічого не надіслано", text)
+        self.assertNotIn("Бойових листів надіслано", text)
+        self.assertIn("лишились у черзі", text)
+
+
+class TestAmbiguousGmailErrors(LiveBase):
+    """Відмова 4xx — лист точно не пішов; 5xx/обрив — міг піти, наосліп не повторюємо."""
+
+    def test_classification(self):
+        for refused in ("400", "403 quota", "invalid_grant: Token has been expired",
+                        "<HttpError 429 when requesting ... returned \"User-rate limit exceeded\">",
+                        "RefreshError('invalid_grant')"):
+            self.assertTrue(M.gmail_refused(refused), refused)
+        for unknown in ("<HttpError 500 when requesting ... returned \"Backend Error\">",
+                        "<HttpError 503 ...>", "IncompleteRead(0 bytes read)", "",
+                        "RemoteDisconnected('Remote end closed connection')"):
+            self.assertFalse(M.gmail_refused(unknown), unknown)
+
+    def send_once(self, transport):
+        eng = self.engine()
+        eng.batch_id = eng.db.one("SELECT batch_id FROM outreach LIMIT 1")["batch_id"]
+        eng.verbose = False
+        stats = eng.send(transport=transport, paced=False)
+        eng.close()
+        return stats
+
+    def test_server_error_is_unknown_and_never_resent_blindly(self):
+        self.build([t_one()])
+        stats = self.send_once(T.FakeTransport(T.FakeResult(
+            ok=False, error="<HttpError 500 when requesting returned \"Backend Error\">")))
+        self.assertEqual(stats["DELIVERY_UNKNOWN"], 1)
+        self.assertEqual(self.letters()[0]["status"], "DELIVERY_UNKNOWN")
+        again = T.FakeTransport()
+        self.send_once(again)
+        self.assertEqual(again.sent, [])                 # повтору наосліп немає
+
+    def test_retry_first_checks_the_sent_folder(self):
+        """Лист повернули в чергу, але Gmail його все ж має — повтору немає."""
+        self.build([t_one()])
+        self.send_once(T.FakeTransport(T.FakeResult(ok=False, error="403 quota")))
+        self.assertEqual(self.letters()[0]["status"], "QUEUED")
+        row = self.letters()[0]
+
+        class AlreadyThere(T.FakeTransport):
+            def find_by_message_id(self, mid):
+                return {"id": "g-1", "threadId": "t-1"} if mid == row["message_id_header"] else None
+        transport = AlreadyThere()
+        stats = self.send_once(transport)
+        self.assertEqual(transport.sent, [])
+        self.assertEqual(stats["SENT_CONFIRMED"], 1)
+        self.assertEqual(self.letters()[0]["status"], "SENT_CONFIRMED")
+
+    def test_summary_counts_letters_found_by_reconcile(self):
+        self.build([t_one()])
+
+        class TimeoutButSent(T.FakeTransport):
+            def send(self, raw, mid):
+                self.sent.append((mid, raw))
+                return T.FakeResult(ok=False, unknown=True, error="timeout")
+        transport = TimeoutButSent()
+        real = M.make_transport
+        M.make_transport = lambda dry_run, out_dir: transport
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                M.send(paced=False)
+        finally:
+            M.make_transport = real
+        text = buf.getvalue()
+        self.assertNotIn("Нічого не надіслано", text)
+        self.assertIn("Бойових листів надіслано: 1", text)
+        self.assertEqual(self.letters()[0]["status"], "SENT_CONFIRMED")
+
+
+class TestServiceCardLabel(LiveBase):
+    def test_service_card_rows_carry_the_mode(self):
+        self.build([t_one()])
+        eng = self.engine()
+        rows = eng.service_card_rows(day="2026-09-22")
+        eng.close()
+        self.assertEqual(rows[0]["letter_mode"], "LIVE")
+        import tenderwin_service_cards as SC                 # noqa: PLC0415
+        view = SC._event_view(rows[0], M.now())
+        self.assertEqual(view["letter_mode"], "LIVE")
+
+
 class TestLetterV10(T.Base):
     """Чинний лист V10: V9 слово в слово, лише телефон «0 800 357 135»."""
 
